@@ -130,6 +130,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._connect_task: asyncio.Task | None = None
         self._listener_removers: list = []
         self._udp_buffer: bytearray = bytearray()  # accumulates resampled PCM
+        self._resample_phase: float = 0.0           # fractional sample offset between chunks
 
     # ── Device info ───────────────────────────────────────────────────────────
 
@@ -283,6 +284,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     def _on_stream_start(self, payload: Any) -> None:
         """Store stream format metadata; mark player as playing."""
         self._udp_buffer.clear()
+        self._resample_phase = 0.0
         self._stream = {
             "codec": getattr(payload, "codec", AudioCodec.PCM),
             "sample_rate": getattr(payload, "sample_rate", 48000),
@@ -299,13 +301,49 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             return
         self.hass.async_create_task(self._process_audio_chunk(data))
 
+    def _decode_and_resample(
+        self, data: bytes, in_rate: int, in_channels: int, in_bit_depth: int
+    ) -> bytes:
+        """Decode PCM to mono float32, then resample with phase continuity."""
+        samples = _decode_to_mono_float(data, in_channels, in_bit_depth)
+        if samples is None or len(samples) == 0:
+            return b""
+        return self._resample_chunk(samples, in_rate)
+
+    def _resample_chunk(self, mono_samples: np.ndarray, in_rate: int) -> bytes:
+        """Resample mono float32 samples to the target rate, maintaining phase.
+
+        Uses a fixed step size (in_rate / target_rate) and carries the
+        fractional sample offset between calls so that chunk boundaries
+        are seamless — no phase jumps, no clicks.
+        """
+        if in_rate == UDP_AUDIO_SAMPLE_RATE:
+            out = np.clip(mono_samples * 32768.0, -32768.0, 32767.0).astype("<i2")
+            return out.tobytes()
+
+        step = in_rate / UDP_AUDIO_SAMPLE_RATE
+        x_out = np.arange(self._resample_phase, len(mono_samples), step, dtype=np.float64)
+        if len(x_out) == 0:
+            # Not enough input samples to produce output yet; carry phase forward
+            self._resample_phase -= len(mono_samples)
+            return b""
+
+        x_in = np.arange(len(mono_samples), dtype=np.float64)
+        resampled = np.interp(x_out, x_in, mono_samples.astype(np.float64)).astype(np.float32)
+
+        # Carry the fractional remainder into the next chunk
+        self._resample_phase = x_out[-1] + step - len(mono_samples)
+
+        out = np.clip(resampled * 32768.0, -32768.0, 32767.0).astype("<i2")
+        return out.tobytes()
+
     async def _process_audio_chunk(self, data: bytes) -> None:
-        """Resample, buffer, and forward audio over UDP in proper-sized chunks."""
+        """Decode, resample, buffer, and forward audio over UDP."""
         loop = asyncio.get_event_loop()
         try:
             resampled: bytes = await loop.run_in_executor(
                 None,
-                _resample_to_target,
+                self._decode_and_resample,
                 data,
                 self._stream.get("sample_rate", 48000),
                 self._stream.get("channels", 2),
@@ -465,73 +503,44 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self.async_write_ha_state()
 
 
-# ── Audio resampling (module-level, runs in executor thread) ──────────────────
+# ── Audio decoding (module-level helper, runs in executor thread) ────────────
 
 
-def _resample_to_target(
+def _decode_to_mono_float(
     data: bytes,
-    in_rate: int,
     in_channels: int,
     in_bit_depth: int,
-) -> bytes:
-    """Resample raw PCM audio to 16 kHz mono 16-bit signed little-endian PCM.
+) -> np.ndarray | None:
+    """Decode raw PCM bytes to mono float32 samples normalised to [-1, 1].
 
-    This function is CPU-bound and is called via ``run_in_executor`` so it
-    never blocks the asyncio event loop.
-
-    Args:
-        data:         Raw PCM bytes from the Sendspin server.
-        in_rate:      Input sample rate in Hz (e.g. 48000).
-        in_channels:  Number of input audio channels (1 = mono, 2 = stereo …).
-        in_bit_depth: Bits per sample of the input (16, 24, or 32).
-
-    Returns:
-        Raw PCM bytes: signed 16-bit little-endian, mono, ``UDP_AUDIO_SAMPLE_RATE`` Hz.
-        Returns ``b""`` if the input is empty or the bit depth is unsupported.
+    Returns None if the data is empty or the bit depth is unsupported.
     """
     if not data:
-        return b""
+        return None
 
-    # ── 1. Decode bytes → float32 normalised to [-1, 1] ──────────────────────
     if in_bit_depth == 16:
         samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
 
     elif in_bit_depth == 24:
-        # 24-bit PCM is stored as 3-byte little-endian signed integers.
         n = len(data) // 3
         if n == 0:
-            return b""
-        # Pad each triplet to 4 bytes (shift left by 8) then interpret as int32.
+            return None
         padded = np.zeros(n * 4, dtype=np.uint8)
         raw = np.frombuffer(data[: n * 3], dtype=np.uint8).reshape(n, 3)
         padded_view = padded.reshape(n, 4)
-        padded_view[:, 1:] = raw          # bytes 1-3 carry the 24-bit value
-        samples = (
-            padded.view("<i4").astype(np.float32) / 2147483648.0  # 2^31
-        )
+        padded_view[:, 1:] = raw
+        samples = padded.view("<i4").astype(np.float32) / 2147483648.0
 
     elif in_bit_depth == 32:
         samples = np.frombuffer(data, dtype="<i4").astype(np.float32) / 2147483648.0
 
     else:
         _LOGGER.warning("Unsupported input bit depth: %d – chunk skipped", in_bit_depth)
-        return b""
+        return None
 
-    # ── 2. Mix multi-channel audio down to mono ───────────────────────────────
+    # Mix multi-channel audio down to mono
     if in_channels > 1:
-        # Ensure sample count is a multiple of in_channels before reshaping.
         trim = len(samples) - (len(samples) % in_channels)
         samples = samples[:trim].reshape(-1, in_channels).mean(axis=1)
 
-    # ── 3. Resample to UDP_AUDIO_SAMPLE_RATE using linear interpolation ───────
-    if in_rate != UDP_AUDIO_SAMPLE_RATE and len(samples) > 1:
-        n_out = max(1, int(round(len(samples) * UDP_AUDIO_SAMPLE_RATE / in_rate)))
-        x_in = np.arange(len(samples), dtype=np.float64)
-        x_out = np.linspace(0.0, len(samples) - 1, n_out, dtype=np.float64)
-        samples = np.interp(x_out, x_in, samples.astype(np.float64)).astype(
-            np.float32
-        )
-
-    # ── 4. Encode as 16-bit signed little-endian PCM ─────────────────────────
-    out = np.clip(samples * 32768.0, -32768.0, 32767.0).astype("<i2")
-    return out.tobytes()
+    return samples
