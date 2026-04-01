@@ -19,29 +19,12 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-def _validate_ip(value: str) -> str:
-    """Validate that the value is a valid IP address or hostname."""
-    value = value.strip()
-    if not value:
-        raise vol.Invalid("IP address / hostname cannot be empty")
-    # Allow hostnames as well – only reject values that look like IPs but are invalid
-    try:
-        ipaddress.ip_address(value)
-    except ValueError:
-        # Not an IP literal – accept as a hostname (non-empty check already done above)
-        pass
-    return value
-
-
-def _validate_ws_url(value: str) -> str:
-    """Validate a WebSocket URL (ws:// or wss://)."""
-    value = value.strip()
-    if not (value.startswith("ws://") or value.startswith("wss://")):
-        raise vol.Invalid("URL must start with ws:// or wss://")
-    return value
-
-
 def _config_schema(defaults: dict) -> vol.Schema:
+    """Return a schema using only HA-serialisable validators.
+
+    Custom validation (URL prefix, IP/hostname) is done manually in the
+    step handlers so voluptuous_serialize can render the form without error.
+    """
     return vol.Schema(
         {
             vol.Required(
@@ -51,17 +34,43 @@ def _config_schema(defaults: dict) -> vol.Schema:
             vol.Required(
                 CONF_SENDSPIN_SERVER_URL,
                 default=defaults.get(CONF_SENDSPIN_SERVER_URL, DEFAULT_SENDSPIN_URL),
-            ): vol.All(cv.string, _validate_ws_url),
+            ): cv.string,
             vol.Required(
                 CONF_UDP_HOST,
                 default=defaults.get(CONF_UDP_HOST, ""),
-            ): vol.All(cv.string, _validate_ip),
+            ): cv.string,
             vol.Required(
                 CONF_UDP_PORT,
                 default=defaults.get(CONF_UDP_PORT, DEFAULT_UDP_PORT),
             ): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
         }
     )
+
+
+def _validate_inputs(user_input: dict) -> dict[str, str]:
+    """Validate fields that cannot be expressed as serialisable schema types.
+
+    Returns a dict of field → error-key for any failures.
+    """
+    errors: dict[str, str] = {}
+
+    # WebSocket URL must start with ws:// or wss://
+    url = user_input.get(CONF_SENDSPIN_SERVER_URL, "").strip()
+    if not (url.startswith("ws://") or url.startswith("wss://")):
+        errors[CONF_SENDSPIN_SERVER_URL] = "invalid_ws_url"
+
+    # UDP host must be a non-empty IP address or hostname
+    host = user_input.get(CONF_UDP_HOST, "").strip()
+    if not host:
+        errors[CONF_UDP_HOST] = "invalid_host"
+    else:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            # Not a bare IP literal – accept as a hostname; reject empty (caught above)
+            pass
+
+    return errors
 
 
 class UDPLyricsPlayerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -80,11 +89,14 @@ class UDPLyricsPlayerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            # Prevent duplicate player names
-            for entry in self._async_current_entries():
-                if entry.data.get(CONF_PLAYER_NAME) == user_input[CONF_PLAYER_NAME]:
-                    errors[CONF_PLAYER_NAME] = "name_exists"
-                    break
+            errors = _validate_inputs(user_input)
+
+            if not errors:
+                # Prevent duplicate player names
+                for entry in self._async_current_entries():
+                    if entry.data.get(CONF_PLAYER_NAME) == user_input[CONF_PLAYER_NAME]:
+                        errors[CONF_PLAYER_NAME] = "name_exists"
+                        break
 
             if not errors:
                 return self.async_create_entry(
@@ -96,12 +108,6 @@ class UDPLyricsPlayerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=_config_schema(user_input or {}),
             errors=errors,
-            description_placeholders={
-                "udp_note": (
-                    "The destination IP and port are where audio will be forwarded "
-                    "for lyrics recognition (e.g. the Music Companion tagging service)."
-                )
-            },
         )
 
 
@@ -116,12 +122,14 @@ class UDPLyricsPlayerOptionsFlow(config_entries.OptionsFlow):
         current = dict(self._config_entry.data)
 
         if user_input is not None:
-            # Merge updated values back into the config entry data
-            current.update(user_input)
-            self.hass.config_entries.async_update_entry(
-                self._config_entry, data=current
-            )
-            return self.async_create_entry(title="", data={})
+            errors = _validate_inputs(user_input)
+
+            if not errors:
+                current.update(user_input)
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=current
+                )
+                return self.async_create_entry(title="", data={})
 
         return self.async_show_form(
             step_id="init",
