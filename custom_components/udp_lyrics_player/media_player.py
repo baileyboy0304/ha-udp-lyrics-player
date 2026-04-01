@@ -289,7 +289,8 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
 
-    async def _on_audio_chunk(self, timestamp: float, data: bytes) -> None:
+    #async def _on_audio_chunk(self, timestamp: float, data: bytes) -> None:
+    async def _on_audio_chunk(self, timestamp: float, data: bytes, audio_format: Any = None) -> None:
         """Receive a PCM audio chunk, resample it, and forward over UDP."""
         if not data or self._udp_sock is None:
             return
