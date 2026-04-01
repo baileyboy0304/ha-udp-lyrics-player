@@ -1,0 +1,11 @@
+{
+  "domain": "udp_lyrics_player",
+  "name": "UDP Lyrics Player",
+  "version": "1.0.0",
+  "config_flow": true,
+  "iot_class": "local_push",
+  "documentation": "https://github.com/baileyboy0304/music_companion",
+  "dependencies": [],
+  "requirements": ["aiosendspin>=0.1.0", "numpy>=1.21.0"],
+  "codeowners": ["@baileyboy0304"]
+}
