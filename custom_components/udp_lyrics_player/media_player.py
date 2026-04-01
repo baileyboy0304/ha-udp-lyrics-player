@@ -58,8 +58,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Maximum UDP payload size (bytes).  Keeps datagrams well below MTU.
-_UDP_MAX_CHUNK = 32768
+# UDP send chunk size in bytes.  1024 frames * 2 bytes/frame = 2048 bytes,
+# matching the chunk size used by standard audio streamers.
+_UDP_SEND_CHUNK = 2048
 
 
 # ── Platform setup ────────────────────────────────────────────────────────────
@@ -128,6 +129,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._stream: dict[str, Any] = {}          # active stream metadata
         self._connect_task: asyncio.Task | None = None
         self._listener_removers: list = []
+        self._udp_buffer: bytearray = bytearray()  # accumulates resampled PCM
 
     # ── Device info ───────────────────────────────────────────────────────────
 
@@ -280,6 +282,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     def _on_stream_start(self, payload: Any) -> None:
         """Store stream format metadata; mark player as playing."""
+        self._udp_buffer.clear()
         self._stream = {
             "codec": getattr(payload, "codec", AudioCodec.PCM),
             "sample_rate": getattr(payload, "sample_rate", 48000),
@@ -297,7 +300,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self.hass.async_create_task(self._process_audio_chunk(data))
 
     async def _process_audio_chunk(self, data: bytes) -> None:
-        """Resample and forward an audio chunk over UDP (async helper)."""
+        """Resample, buffer, and forward audio over UDP in proper-sized chunks."""
         loop = asyncio.get_event_loop()
         try:
             resampled: bytes = await loop.run_in_executor(
@@ -315,10 +318,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         if not resampled:
             return
 
+        # Accumulate resampled PCM and send in _UDP_SEND_CHUNK-sized packets
+        self._udp_buffer.extend(resampled)
+
         try:
             dest = (self._udp_host, self._udp_port)
-            for offset in range(0, len(resampled), _UDP_MAX_CHUNK):
-                chunk = resampled[offset : offset + _UDP_MAX_CHUNK]
+            while len(self._udp_buffer) >= _UDP_SEND_CHUNK:
+                chunk = bytes(self._udp_buffer[:_UDP_SEND_CHUNK])
+                del self._udp_buffer[:_UDP_SEND_CHUNK]
                 await loop.run_in_executor(
                     None, self._udp_sock.sendto, chunk, dest
                 )
@@ -326,8 +333,15 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             _LOGGER.debug("UDP send error: %s", exc)
 
     def _on_stream_end(self) -> None:
-        """Clear stream metadata when the server ends the stream."""
+        """Flush remaining buffer and clear stream metadata."""
         _LOGGER.debug("Sendspin stream ended")
+        if self._udp_buffer and self._udp_sock is not None:
+            try:
+                dest = (self._udp_host, self._udp_port)
+                self._udp_sock.sendto(bytes(self._udp_buffer), dest)
+            except Exception as exc:
+                _LOGGER.debug("UDP flush error: %s", exc)
+        self._udp_buffer.clear()
         self._stream = {}
 
     def _on_group_update(self, state: Any) -> None:
