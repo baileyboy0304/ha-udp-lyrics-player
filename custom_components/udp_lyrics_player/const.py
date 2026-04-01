@@ -8,7 +8,7 @@ CONF_UDP_PORT = "udp_port"
 
 # Defaults
 DEFAULT_UDP_PORT = 6056
-DEFAULT_SENDSPIN_URL = "ws://homeassistant.local:7979/sendspin"
+DEFAULT_SENDSPIN_URL = "ws://192.168.1.137:8927/sendspin"
 
 # Audio target format for UDP output (required by the lyrics recognizer)
 UDP_AUDIO_SAMPLE_RATE = 16000   # Hz

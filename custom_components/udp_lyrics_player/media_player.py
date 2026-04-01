@@ -276,8 +276,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             self._sendspin = None
 
     # ── Sendspin event callbacks ──────────────────────────────────────────────
+    # aiosendspin expects synchronous (non-async) listener functions.
 
-    async def _on_stream_start(self, payload: Any) -> None:
+    def _on_stream_start(self, payload: Any) -> None:
         """Store stream format metadata; mark player as playing."""
         self._stream = {
             "codec": getattr(payload, "codec", AudioCodec.PCM),
@@ -289,15 +290,16 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
 
-    #async def _on_audio_chunk(self, timestamp: float, data: bytes) -> None:
-    async def _on_audio_chunk(self, timestamp: float, data: bytes, audio_format: Any = None) -> None:
+    def _on_audio_chunk(self, timestamp: float, data: bytes, audio_format: Any = None) -> None:
         """Receive a PCM audio chunk, resample it, and forward over UDP."""
         if not data or self._udp_sock is None:
             return
+        self.hass.async_create_task(self._process_audio_chunk(data))
 
+    async def _process_audio_chunk(self, data: bytes) -> None:
+        """Resample and forward an audio chunk over UDP (async helper)."""
         loop = asyncio.get_event_loop()
         try:
-            # Offload CPU-bound resampling to a thread so the event loop stays free.
             resampled: bytes = await loop.run_in_executor(
                 None,
                 _resample_to_target,
@@ -313,9 +315,6 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         if not resampled:
             return
 
-        # Send over UDP in chunks ≤ _UDP_MAX_CHUNK bytes so datagrams stay
-        # well within MTU limits.  Each chunk is sent via run_in_executor so
-        # the (non-blocking) sendto call does not stall the event loop.
         try:
             dest = (self._udp_host, self._udp_port)
             for offset in range(0, len(resampled), _UDP_MAX_CHUNK):
@@ -326,12 +325,12 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         except Exception as exc:
             _LOGGER.debug("UDP send error: %s", exc)
 
-    async def _on_stream_end(self) -> None:
+    def _on_stream_end(self) -> None:
         """Clear stream metadata when the server ends the stream."""
         _LOGGER.debug("Sendspin stream ended")
         self._stream = {}
 
-    async def _on_group_update(self, state: Any) -> None:
+    def _on_group_update(self, state: Any) -> None:
         """Sync HA state with the Sendspin group playback state."""
         try:
             raw = (
@@ -351,7 +350,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         except Exception as exc:
             _LOGGER.debug("Group update error: %s", exc)
 
-    async def _on_metadata(self, metadata: Any) -> None:
+    def _on_metadata(self, metadata: Any) -> None:
         """Update track title / artist from Sendspin metadata."""
         try:
             if isinstance(metadata, dict):
@@ -370,7 +369,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         except Exception as exc:
             _LOGGER.debug("Metadata update error: %s", exc)
 
-    async def _on_server_command(self, payload: Any) -> None:
+    def _on_server_command(self, payload: Any) -> None:
         """Apply volume / mute commands sent by the Sendspin server."""
         try:
             volume = getattr(payload, "volume", None)
@@ -383,7 +382,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         except Exception as exc:
             _LOGGER.debug("Server command error: %s", exc)
 
-    async def _on_disconnect(self, reason: str) -> None:
+    def _on_disconnect(self, reason: str) -> None:
         """Handle server-initiated disconnection."""
         _LOGGER.warning(
             "UDP Lyrics Player '%s' disconnected from Sendspin: %s",
