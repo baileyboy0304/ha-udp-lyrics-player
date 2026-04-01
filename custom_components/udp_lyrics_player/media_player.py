@@ -21,6 +21,20 @@ import uuid
 from typing import Any
 
 import numpy as np
+from aiosendspin.client import SendspinClient
+from aiosendspin.models import (
+    AudioCodec,
+    DeviceInfo,
+    MediaCommand,
+    PlayerCommand,
+    PlayerStateType,
+    Roles,
+)
+from aiosendspin.models.core import GoodbyeReason
+from aiosendspin.models.player import (
+    ClientHelloPlayerSupport,
+    SupportedAudioFormat,
+)
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -46,17 +60,6 @@ _LOGGER = logging.getLogger(__name__)
 
 # Maximum UDP payload size (bytes).  Keeps datagrams well below MTU.
 _UDP_MAX_CHUNK = 32768
-
-from aiosendspin import (
-    AudioCodec,
-    ClientHelloPlayerSupport,
-    DeviceInfo,
-    MediaCommand,
-    PlayerCommand,
-    Roles,
-    SendspinClient,
-    SupportedAudioFormat,
-)
 
 
 # ── Platform setup ────────────────────────────────────────────────────────────
@@ -203,7 +206,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         player_support = ClientHelloPlayerSupport(
             supported_formats=supported_formats,
-            buffer_bytes=512 * 1024,  # 512 KB jitter buffer
+            buffer_capacity=512 * 1024,  # 512 KB jitter buffer
             supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
         )
 
@@ -266,7 +269,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         if self._sendspin is not None:
             try:
                 if self._sendspin.connected:
-                    await self._sendspin.send_goodbye()
+                    await self._sendspin.send_goodbye(GoodbyeReason.SHUTDOWN)
                     await self._sendspin.disconnect()
             except Exception as exc:
                 _LOGGER.debug("Error during Sendspin disconnect: %s", exc)
@@ -425,7 +428,11 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._attr_volume_level = volume
         if self._sendspin and self._sendspin.connected:
             try:
-                await self._sendspin.send_player_state()
+                await self._sendspin.send_player_state(
+                    state=PlayerStateType.SYNCHRONIZED,
+                    volume=int(self._attr_volume_level * 100),
+                    muted=self._attr_is_volume_muted,
+                )
             except Exception as exc:
                 _LOGGER.debug("send_player_state error: %s", exc)
         self.async_write_ha_state()
@@ -434,7 +441,11 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._attr_is_volume_muted = mute
         if self._sendspin and self._sendspin.connected:
             try:
-                await self._sendspin.send_player_state()
+                await self._sendspin.send_player_state(
+                    state=PlayerStateType.SYNCHRONIZED,
+                    volume=int(self._attr_volume_level * 100),
+                    muted=self._attr_is_volume_muted,
+                )
             except Exception as exc:
                 _LOGGER.debug("send_player_state error: %s", exc)
         self.async_write_ha_state()
