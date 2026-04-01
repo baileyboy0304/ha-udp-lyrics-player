@@ -1,0 +1,51 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "UDP Lyrics Player",
+        "description": "Set up a Sendspin player that forwards audio over UDP.",
+        "data": {
+          "player_name": "Player name",
+          "sendspin_server_url": "Sendspin server URL",
+          "udp_host": "UDP destination host",
+          "udp_port": "UDP destination port"
+        },
+        "data_description": {
+          "sendspin_server_url": "WebSocket URL of the Sendspin server (ws:// or wss://)",
+          "udp_host": "IP address or hostname to send audio to",
+          "udp_port": "Port to send audio to (default 6056)"
+        }
+      }
+    },
+    "error": {
+      "invalid_ws_url": "URL must start with ws:// or wss://",
+      "invalid_host": "A valid IP address or hostname is required",
+      "name_exists": "A player with this name already exists"
+    },
+    "abort": {
+      "already_configured": "This player is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "UDP Lyrics Player Options",
+        "data": {
+          "player_name": "Player name",
+          "sendspin_server_url": "Sendspin server URL",
+          "udp_host": "UDP destination host",
+          "udp_port": "UDP destination port"
+        },
+        "data_description": {
+          "sendspin_server_url": "WebSocket URL of the Sendspin server (ws:// or wss://)",
+          "udp_host": "IP address or hostname to send audio to",
+          "udp_port": "Port to send audio to (default 6056)"
+        }
+      }
+    },
+    "error": {
+      "invalid_ws_url": "URL must start with ws:// or wss://",
+      "invalid_host": "A valid IP address or hostname is required"
+    }
+  }
+}
