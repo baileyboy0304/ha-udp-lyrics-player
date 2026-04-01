@@ -47,26 +47,16 @@ _LOGGER = logging.getLogger(__name__)
 # Maximum UDP payload size (bytes).  Keeps datagrams well below MTU.
 _UDP_MAX_CHUNK = 32768
 
-# ── aiosendspin optional import ───────────────────────────────────────────────
-try:
-    from aiosendspin import (
-        AudioCodec,
-        ClientHelloPlayerSupport,
-        DeviceInfo,
-        MediaCommand,
-        PlayerCommand,
-        Roles,
-        SendspinClient,
-        SupportedAudioFormat,
-    )
-
-    _AIOSENDSPIN_OK = True
-except ImportError:
-    _AIOSENDSPIN_OK = False
-    _LOGGER.error(
-        "aiosendspin is not installed – UDP Lyrics Player will not connect to "
-        "Sendspin.  Add 'aiosendspin' to your HA Python environment."
-    )
+from aiosendspin import (
+    AudioCodec,
+    ClientHelloPlayerSupport,
+    DeviceInfo,
+    MediaCommand,
+    PlayerCommand,
+    Roles,
+    SendspinClient,
+    SupportedAudioFormat,
+)
 
 
 # ── Platform setup ────────────────────────────────────────────────────────────
@@ -188,9 +178,6 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     async def _run_sendspin(self) -> None:
         """Connect to the Sendspin server and keep the connection alive."""
-        if not _AIOSENDSPIN_OK:
-            return
-
         # Advertise PCM formats so the server sends raw samples (no decoder needed).
         # Preferred: exact target format; fallback: common 48 kHz stereo.
         supported_formats = [
@@ -290,7 +277,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     async def _on_stream_start(self, payload: Any) -> None:
         """Store stream format metadata; mark player as playing."""
         self._stream = {
-            "codec": getattr(payload, "codec", AudioCodec.PCM if _AIOSENDSPIN_OK else None),
+            "codec": getattr(payload, "codec", AudioCodec.PCM),
             "sample_rate": getattr(payload, "sample_rate", 48000),
             "channels": getattr(payload, "channels", 2),
             "bit_depth": getattr(payload, "bit_depth", 16),
