@@ -127,6 +127,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # Audio pipeline state — only touched by the single worker task.
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._udp_buffer: bytearray = bytearray()
+        self._in_buffer: bytearray = bytearray()
         self._resampler: av.AudioResampler | None = None
 
     # ── Device info ───────────────────────────────────────────────────────────
@@ -327,7 +328,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         Called from an executor thread by the single worker task.
         """
-        if not data or self._resampler is None:
+        if self._resampler is None:
             return b""
 
         in_rate = self._stream.get("sample_rate", 48000)
@@ -347,16 +348,25 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         layout = 'stereo' if in_channels == 2 else 'mono'
         frame_size = bytes_per_sample * in_channels
-        samples = len(data) // frame_size
+        
+        # Buffer incoming incomplete frames
+        if data:
+            self._in_buffer.extend(data)
+            
+        samples = len(self._in_buffer) // frame_size
 
         if samples == 0:
             return b""
 
+        bytes_to_consume = samples * frame_size
+        chunk_data = bytes(self._in_buffer[:bytes_to_consume])
+        del self._in_buffer[:bytes_to_consume]
+
         try:
-            # 1. Create PyAV frame from input data
+            # 1. Create PyAV frame using only completely aligned frames
             frame = av.AudioFrame(format=in_format, layout=layout, samples=samples)
             frame.sample_rate = in_rate
-            frame.planes[0].update(data)
+            frame.planes[0].update(chunk_data)
 
             # 2. Resample to target format
             out_frames = self._resampler.resample(frame)
@@ -378,6 +388,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     def _on_stream_start(self, payload: Any) -> None:
         """Store stream format metadata and create the PyAV resampler."""
         self._udp_buffer.clear()
+        self._in_buffer.clear()
 
         # Drain stale chunks from a previous stream
         while not self._audio_queue.empty():
@@ -386,12 +397,22 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             except asyncio.QueueEmpty:
                 break
 
-        in_rate = getattr(payload, "sample_rate", 48000)
+        if isinstance(payload, dict):
+            in_rate = payload.get("sample_rate", 48000)
+            in_codec = payload.get("codec", AudioCodec.PCM)
+            in_channels = payload.get("channels", 2)
+            in_bit_depth = payload.get("bit_depth", 16)
+        else:
+            in_rate = getattr(payload, "sample_rate", 48000)
+            in_codec = getattr(payload, "codec", AudioCodec.PCM)
+            in_channels = getattr(payload, "channels", 2)
+            in_bit_depth = getattr(payload, "bit_depth", 16)
+
         self._stream = {
-            "codec": getattr(payload, "codec", AudioCodec.PCM),
+            "codec": in_codec,
             "sample_rate": in_rate,
-            "channels": getattr(payload, "channels", 2),
-            "bit_depth": getattr(payload, "bit_depth", 16),
+            "channels": in_channels,
+            "bit_depth": in_bit_depth,
         }
 
         # Create a fresh PyAV streaming resampler
@@ -433,6 +454,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             except Exception as exc:
                 _LOGGER.debug("UDP flush error: %s", exc)
         self._udp_buffer.clear()
+        self._in_buffer.clear()
         self._stream = {}
 
     def _on_group_update(self, state: Any) -> None:
