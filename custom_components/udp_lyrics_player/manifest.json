@@ -6,6 +6,6 @@
   "iot_class": "local_push",
   "documentation": "https://github.com/baileyboy0304/music_companion",
   "dependencies": [],
-  "requirements": ["aiosendspin>=4.4.0", "numpy>=1.26.0", "soxr>=0.3.0"],
+  "requirements": ["aiosendspin>=4.4.0", "av>=10.0.0"],
   "codeowners": ["@baileyboy0304"]
 }
