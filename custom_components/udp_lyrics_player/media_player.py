@@ -8,8 +8,9 @@ lyrics-recognition (tagging) service.
 
 Audio pipeline
 --------------
-Sendspin server  →  aiosendspin client  →  resample (numpy)  →  UDP socket
-    (any PCM)            (WebSocket)       → 16 kHz / mono / s16le   → IP:port
+Sendspin server  →  aiosendspin client  →  decode/mix  →  soxr resample
+    (any PCM)            (WebSocket)       → mono float32   → 16 kHz s16le
+                                                             → UDP socket
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import uuid
 from typing import Any
 
 import numpy as np
+import soxr
 from aiosendspin.client import SendspinClient
 from aiosendspin.models import (
     AudioCodec,
@@ -58,8 +60,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# UDP send chunk size in bytes.  1024 frames * 2 bytes/frame = 2048 bytes,
-# matching the chunk size used by standard audio streamers.
+# UDP send chunk: 1024 frames * 2 bytes/frame = 2048 bytes.
 _UDP_SEND_CHUNK = 2048
 
 
@@ -79,17 +80,11 @@ async def async_setup_entry(
 
 
 class UDPLyricsPlayer(MediaPlayerEntity):
-    """Sendspin-compatible dummy player that forwards audio over UDP.
-
-    Controls (play / pause / stop / next / previous / volume / mute) relay
-    group commands to the Sendspin server so that all real players in the
-    group respond.  The entity's own state is kept in sync with the group
-    state reported by the server.
-    """
+    """Sendspin-compatible player that forwards audio over UDP."""
 
     _attr_should_poll = False
     _attr_has_entity_name = True
-    _attr_name = None  # use device name as entity name
+    _attr_name = None
 
     # ── Construction ──────────────────────────────────────────────────────────
 
@@ -101,7 +96,6 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._udp_host: str = config_entry.data[CONF_UDP_HOST]
         self._udp_port: int = config_entry.data[CONF_UDP_PORT]
 
-        # Unique, stable client ID derived from the entry ID
         self._client_id: str = str(
             uuid.uuid5(uuid.NAMESPACE_DNS, config_entry.entry_id)
         )
@@ -131,10 +125,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._worker_task: asyncio.Task | None = None
         self._listener_removers: list = []
 
-        # Audio pipeline state — only accessed by the single worker task
+        # Audio pipeline state — only touched by the single worker task.
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._udp_buffer: bytearray = bytearray()
-        self._resample_phase: float = 0.0
+        self._resampler: soxr.ResampleStream | None = None
 
     # ── Device info ───────────────────────────────────────────────────────────
 
@@ -174,14 +168,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         await self._teardown_sendspin()
         self._close_udp_socket()
 
-    # ── UDP socket helpers ────────────────────────────────────────────────────
+    # ── UDP socket ────────────────────────────────────────────────────────────
 
     def _open_udp_socket(self) -> None:
         """Create a blocking UDP socket.
 
-        Blocking is correct here because sendto runs inside an executor
-        thread.  A non-blocking socket would raise BlockingIOError and
-        silently drop packets when the OS send buffer is momentarily full.
+        Blocking is correct here — sendto runs in an executor thread.
+        A non-blocking socket raises BlockingIOError and silently drops
+        packets when the OS send buffer is momentarily full.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._udp_sock = sock
@@ -250,7 +244,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         try:
             _LOGGER.info(
-                "UDP Lyrics Player '%s' connecting to Sendspin server %s",
+                "UDP Lyrics Player '%s' connecting to %s",
                 self._player_name,
                 self._server_url,
             )
@@ -295,8 +289,8 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     async def _audio_worker_loop(self) -> None:
         """Process audio chunks one-by-one in strict chronological order.
 
-        A single worker task drains the queue, ensuring that
-        _udp_buffer and _resample_phase are never accessed concurrently.
+        A single worker task drains the queue so that _udp_buffer and
+        _resampler are never accessed concurrently.
         """
         loop = asyncio.get_event_loop()
         dest = (self._udp_host, self._udp_port)
@@ -308,58 +302,80 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 if self._udp_sock is None:
                     continue
 
-                # Decode and resample in a thread to keep the event loop free
-                resampled: bytes = await loop.run_in_executor(
-                    None,
-                    self._decode_and_resample,
-                    data,
-                    self._stream.get("sample_rate", 48000),
-                    self._stream.get("channels", 2),
-                    self._stream.get("bit_depth", 16),
+                # Decode, mix to mono, resample — all in an executor thread
+                pcm_out: bytes = await loop.run_in_executor(
+                    None, self._process_chunk, data
                 )
 
-                if not resampled:
+                if not pcm_out:
                     continue
 
-                self._udp_buffer.extend(resampled)
+                self._udp_buffer.extend(pcm_out)
 
                 # Drain buffer in _UDP_SEND_CHUNK-sized packets
                 while len(self._udp_buffer) >= _UDP_SEND_CHUNK:
                     chunk = bytes(self._udp_buffer[:_UDP_SEND_CHUNK])
                     del self._udp_buffer[:_UDP_SEND_CHUNK]
-                    try:
-                        await loop.run_in_executor(
-                            None, self._udp_sock.sendto, chunk, dest
-                        )
-                    except Exception as exc:
-                        _LOGGER.debug("UDP send error: %s", exc)
+                    self._udp_sock.sendto(chunk, dest)
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 _LOGGER.debug("Audio worker error: %s", exc)
 
-    # ── Sendspin event callbacks ──────────────────────────────────────────────
-    # aiosendspin expects synchronous (non-async) listener functions.
+    def _process_chunk(self, data: bytes) -> bytes:
+        """Decode raw PCM to mono, resample via soxr, encode to s16le.
+
+        Called from an executor thread by the single worker task.
+        """
+        in_rate = self._stream.get("sample_rate", 48000)
+        in_channels = self._stream.get("channels", 2)
+        in_bit_depth = self._stream.get("bit_depth", 16)
+
+        # ── 1. Decode to mono float32 [-1.0, 1.0] ───────────────────────
+        mono = _decode_to_mono_float(data, in_channels, in_bit_depth)
+        if mono is None or len(mono) == 0:
+            return b""
+
+        # ── 2. Resample to target rate via soxr ─────────────────────────
+        if self._resampler is not None:
+            mono = self._resampler.resample_chunk(mono)
+            if len(mono) == 0:
+                return b""
+
+        # ── 3. Encode to signed 16-bit little-endian PCM ────────────────
+        out = np.clip(mono * 32768.0, -32768.0, 32767.0).astype("<i2")
+        return out.tobytes()
+
+    # ── Sendspin event callbacks (synchronous, as aiosendspin requires) ───────
 
     def _on_stream_start(self, payload: Any) -> None:
-        """Store stream format metadata; mark player as playing."""
+        """Store stream format metadata and create the soxr resampler."""
         self._udp_buffer.clear()
-        self._resample_phase = 0.0
 
-        # Drain any stale chunks from a previous stream
+        # Drain stale chunks from a previous stream
         while not self._audio_queue.empty():
             try:
                 self._audio_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
 
+        in_rate = getattr(payload, "sample_rate", 48000)
         self._stream = {
             "codec": getattr(payload, "codec", AudioCodec.PCM),
-            "sample_rate": getattr(payload, "sample_rate", 48000),
+            "sample_rate": in_rate,
             "channels": getattr(payload, "channels", 2),
             "bit_depth": getattr(payload, "bit_depth", 16),
         }
+
+        # Create a fresh soxr streaming resampler (or None if no conversion)
+        if in_rate != UDP_AUDIO_SAMPLE_RATE:
+            self._resampler = soxr.ResampleStream(
+                in_rate, UDP_AUDIO_SAMPLE_RATE, 1, dtype="float32"
+            )
+        else:
+            self._resampler = None
+
         _LOGGER.debug("Sendspin stream started: %s", self._stream)
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
@@ -368,13 +384,29 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self, timestamp: float, data: bytes, audio_format: Any = None
     ) -> None:
         """Queue the incoming audio chunk for the worker to process."""
-        if not data or self._udp_sock is None:
-            return
-        self._audio_queue.put_nowait(data)
+        if data and self._udp_sock is not None:
+            self._audio_queue.put_nowait(data)
 
     def _on_stream_end(self) -> None:
-        """Flush remaining buffer and clear stream metadata."""
+        """Flush the soxr resampler tail, send remaining buffer, clean up."""
         _LOGGER.debug("Sendspin stream ended")
+
+        # Flush the resampler's internal delay line
+        if self._resampler is not None:
+            try:
+                tail = self._resampler.resample_chunk(
+                    np.array([], dtype=np.float32), last=True
+                )
+                if len(tail) > 0:
+                    pcm = np.clip(
+                        tail * 32768.0, -32768.0, 32767.0
+                    ).astype("<i2").tobytes()
+                    self._udp_buffer.extend(pcm)
+            except Exception as exc:
+                _LOGGER.debug("Resampler flush error: %s", exc)
+            self._resampler = None
+
+        # Send whatever remains in the UDP buffer
         if self._udp_buffer and self._udp_sock is not None:
             try:
                 dest = (self._udp_host, self._udp_port)
@@ -447,53 +479,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._stream = {}
         self.async_write_ha_state()
 
-    # ── Resampling (instance methods — access _resample_phase) ────────────────
-
-    def _decode_and_resample(
-        self, data: bytes, in_rate: int, in_channels: int, in_bit_depth: int
-    ) -> bytes:
-        """Decode PCM to mono float32, then resample with phase continuity."""
-        samples = _decode_to_mono_float(data, in_channels, in_bit_depth)
-        if samples is None or len(samples) == 0:
-            return b""
-        return self._resample_chunk(samples, in_rate)
-
-    def _resample_chunk(self, mono_samples: np.ndarray, in_rate: int) -> bytes:
-        """Resample mono float32 samples to the target rate, maintaining phase.
-
-        Uses a fixed step size (in_rate / target_rate) and carries the
-        fractional sample offset between calls so that chunk boundaries
-        are seamless — no phase jumps, no clicks.
-        """
-        if in_rate == UDP_AUDIO_SAMPLE_RATE:
-            out = np.clip(
-                mono_samples * 32768.0, -32768.0, 32767.0
-            ).astype("<i2")
-            return out.tobytes()
-
-        step = in_rate / UDP_AUDIO_SAMPLE_RATE
-        x_out = np.arange(
-            self._resample_phase, len(mono_samples), step, dtype=np.float64
-        )
-        if len(x_out) == 0:
-            self._resample_phase -= len(mono_samples)
-            return b""
-
-        x_in = np.arange(len(mono_samples), dtype=np.float64)
-        resampled = np.interp(
-            x_out, x_in, mono_samples.astype(np.float64)
-        ).astype(np.float32)
-
-        # Carry the fractional remainder into the next chunk
-        self._resample_phase = x_out[-1] + step - len(mono_samples)
-
-        out = np.clip(resampled * 32768.0, -32768.0, 32767.0).astype("<i2")
-        return out.tobytes()
-
     # ── HA media player controls ──────────────────────────────────────────────
 
     async def _send_group_cmd(self, command: Any) -> None:
-        """Send a group command to the Sendspin server (best-effort)."""
         if self._sendspin and self._sendspin.connected:
             try:
                 await self._sendspin.send_group_command(command)
@@ -548,7 +536,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self.async_write_ha_state()
 
 
-# ── Audio decoding (module-level helper, runs in executor thread) ────────────
+# ── Audio decoding (module-level, runs in executor thread) ────────────────────
 
 
 def _decode_to_mono_float(
@@ -558,36 +546,34 @@ def _decode_to_mono_float(
 ) -> np.ndarray | None:
     """Decode raw PCM bytes to mono float32 samples normalised to [-1, 1].
 
-    Returns None if the data is empty or the bit depth is unsupported.
+    Byte order: little-endian (standard PCM / WAV convention).
     """
     if not data:
         return None
 
     if in_bit_depth == 16:
+        # s16le: signed 16-bit little-endian
         samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
 
     elif in_bit_depth == 24:
+        # s24le: 3-byte little-endian signed — pad to 32-bit for numpy
         n = len(data) // 3
         if n == 0:
             return None
-        padded = np.zeros(n * 4, dtype=np.uint8)
         raw = np.frombuffer(data[: n * 3], dtype=np.uint8).reshape(n, 3)
-        padded_view = padded.reshape(n, 4)
-        padded_view[:, 1:] = raw
-        samples = padded.view("<i4").astype(np.float32) / 2147483648.0
+        padded = np.zeros((n, 4), dtype=np.uint8)
+        padded[:, 1:] = raw  # shift left by 8 bits → top 24 bits of int32
+        samples = padded.view("<i4").reshape(n).astype(np.float32) / 2147483648.0
 
     elif in_bit_depth == 32:
-        samples = np.frombuffer(
-            data, dtype="<i4"
-        ).astype(np.float32) / 2147483648.0
+        # s32le: signed 32-bit little-endian
+        samples = np.frombuffer(data, dtype="<i4").astype(np.float32) / 2147483648.0
 
     else:
-        _LOGGER.warning(
-            "Unsupported input bit depth: %d – chunk skipped", in_bit_depth
-        )
+        _LOGGER.warning("Unsupported bit depth: %d", in_bit_depth)
         return None
 
-    # Mix multi-channel audio down to mono
+    # Mix to mono: interleaved [L0 R0 L1 R1 …] → average across channels
     if in_channels > 1:
         trim = len(samples) - (len(samples) % in_channels)
         samples = samples[:trim].reshape(-1, in_channels).mean(axis=1)
