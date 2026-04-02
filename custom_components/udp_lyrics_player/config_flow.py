@@ -78,14 +78,14 @@ class UDPLyricsPlayerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    # ── Options cog ──────────────────────────────────────────────────────────
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
+        """Create the options flow."""
         return UDPLyricsPlayerOptionsFlow(config_entry)
 
-    # ── Initial user step ─────────────────────────────────────────────────────
     async def async_step_user(self, user_input=None):
+        """Handle the initial configuration step."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
