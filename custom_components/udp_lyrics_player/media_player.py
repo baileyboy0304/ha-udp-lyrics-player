@@ -8,8 +8,8 @@ lyrics-recognition (tagging) service.
 
 Audio pipeline
 --------------
-Sendspin server  →  aiosendspin client  →  decode/mix  →  soxr resample
-    (any PCM)            (WebSocket)       → mono float32   → 16 kHz s16le
+Sendspin server  →  aiosendspin client  →  av.AudioFrame   →  PyAV resample
+    (any PCM)            (WebSocket)       → interleaved    → 16 kHz s16le mono
                                                              → UDP socket
 """
 
@@ -21,8 +21,7 @@ import socket
 import uuid
 from typing import Any
 
-import numpy as np
-import soxr
+import av
 from aiosendspin.client import SendspinClient
 from aiosendspin.models import (
     AudioCodec,
@@ -128,7 +127,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # Audio pipeline state — only touched by the single worker task.
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._udp_buffer: bytearray = bytearray()
-        self._resampler: soxr.ResampleStream | None = None
+        self._resampler: av.AudioResampler | None = None
 
     # ── Device info ───────────────────────────────────────────────────────────
 
@@ -324,33 +323,60 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 _LOGGER.debug("Audio worker error: %s", exc)
 
     def _process_chunk(self, data: bytes) -> bytes:
-        """Decode raw PCM to mono, resample via soxr, encode to s16le.
+        """Decode raw PCM, resample via PyAV, and encode to s16le mono.
 
         Called from an executor thread by the single worker task.
         """
+        if not data or self._resampler is None:
+            return b""
+
         in_rate = self._stream.get("sample_rate", 48000)
         in_channels = self._stream.get("channels", 2)
         in_bit_depth = self._stream.get("bit_depth", 16)
 
-        # ── 1. Decode to mono float32 [-1.0, 1.0] ───────────────────────
-        mono = _decode_to_mono_float(data, in_channels, in_bit_depth)
-        if mono is None or len(mono) == 0:
+        # Convert bit_depth to PyAV format
+        if in_bit_depth == 16:
+            in_format = "s16"
+            bytes_per_sample = 2
+        elif in_bit_depth == 32:
+            in_format = "s32"
+            bytes_per_sample = 4
+        else:
+            _LOGGER.warning("Unsupported bit depth: %d", in_bit_depth)
             return b""
 
-        # ── 2. Resample to target rate via soxr ─────────────────────────
-        if self._resampler is not None:
-            mono = self._resampler.resample_chunk(mono)
-            if len(mono) == 0:
-                return b""
+        layout = 'stereo' if in_channels == 2 else 'mono'
+        frame_size = bytes_per_sample * in_channels
+        samples = len(data) // frame_size
 
-        # ── 3. Encode to signed 16-bit little-endian PCM ────────────────
-        out = np.clip(mono * 32768.0, -32768.0, 32767.0).astype("<i2")
-        return out.tobytes()
+        if samples == 0:
+            return b""
+
+        try:
+            # 1. Create PyAV frame from input data
+            frame = av.AudioFrame(format=in_format, layout=layout, samples=samples)
+            frame.sample_rate = in_rate
+            frame.planes[0].update(data)
+
+            # 2. Resample to target format
+            out_frames = self._resampler.resample(frame)
+
+            # 3. Extract s16le bytes
+            out_bytes = bytearray()
+            for out in out_frames:
+                # s16 mono = 2 bytes per sample
+                b = bytes(out.planes[0])[: out.samples * 2]
+                out_bytes.extend(b)
+
+            return bytes(out_bytes)
+        except Exception as exc:
+            _LOGGER.debug("PyAV resample error: %s", exc)
+            return b""
 
     # ── Sendspin event callbacks (synchronous, as aiosendspin requires) ───────
 
     def _on_stream_start(self, payload: Any) -> None:
-        """Store stream format metadata and create the soxr resampler."""
+        """Store stream format metadata and create the PyAV resampler."""
         self._udp_buffer.clear()
 
         # Drain stale chunks from a previous stream
@@ -368,13 +394,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             "bit_depth": getattr(payload, "bit_depth", 16),
         }
 
-        # Create a fresh soxr streaming resampler (or None if no conversion)
-        if in_rate != UDP_AUDIO_SAMPLE_RATE:
-            self._resampler = soxr.ResampleStream(
-                in_rate, UDP_AUDIO_SAMPLE_RATE, 1, dtype="float32"
-            )
-        else:
-            self._resampler = None
+        # Create a fresh PyAV streaming resampler
+        self._resampler = av.AudioResampler(
+            format="s16", layout="mono", rate=UDP_AUDIO_SAMPLE_RATE
+        )
 
         _LOGGER.debug("Sendspin stream started: %s", self._stream)
         self._attr_state = MediaPlayerState.PLAYING
@@ -394,14 +417,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # Flush the resampler's internal delay line
         if self._resampler is not None:
             try:
-                tail = self._resampler.resample_chunk(
-                    np.array([], dtype=np.float32), last=True
-                )
-                if len(tail) > 0:
-                    pcm = np.clip(
-                        tail * 32768.0, -32768.0, 32767.0
-                    ).astype("<i2").tobytes()
-                    self._udp_buffer.extend(pcm)
+                tail_frames = self._resampler.resample(None)
+                for out in tail_frames:
+                    b = bytes(out.planes[0])[: out.samples * 2]
+                    self._udp_buffer.extend(b)
             except Exception as exc:
                 _LOGGER.debug("Resampler flush error: %s", exc)
             self._resampler = None
@@ -536,46 +555,3 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self.async_write_ha_state()
 
 
-# ── Audio decoding (module-level, runs in executor thread) ────────────────────
-
-
-def _decode_to_mono_float(
-    data: bytes,
-    in_channels: int,
-    in_bit_depth: int,
-) -> np.ndarray | None:
-    """Decode raw PCM bytes to mono float32 samples normalised to [-1, 1].
-
-    Byte order: little-endian (standard PCM / WAV convention).
-    """
-    if not data:
-        return None
-
-    if in_bit_depth == 16:
-        # s16le: signed 16-bit little-endian
-        samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
-
-    elif in_bit_depth == 24:
-        # s24le: 3-byte little-endian signed — pad to 32-bit for numpy
-        n = len(data) // 3
-        if n == 0:
-            return None
-        raw = np.frombuffer(data[: n * 3], dtype=np.uint8).reshape(n, 3)
-        padded = np.zeros((n, 4), dtype=np.uint8)
-        padded[:, 1:] = raw  # shift left by 8 bits → top 24 bits of int32
-        samples = padded.view("<i4").reshape(n).astype(np.float32) / 2147483648.0
-
-    elif in_bit_depth == 32:
-        # s32le: signed 32-bit little-endian
-        samples = np.frombuffer(data, dtype="<i4").astype(np.float32) / 2147483648.0
-
-    else:
-        _LOGGER.warning("Unsupported bit depth: %d", in_bit_depth)
-        return None
-
-    # Mix to mono: interleaved [L0 R0 L1 R1 …] → average across channels
-    if in_channels > 1:
-        trim = len(samples) - (len(samples) % in_channels)
-        samples = samples[:trim].reshape(-1, in_channels).mean(axis=1)
-
-    return samples
