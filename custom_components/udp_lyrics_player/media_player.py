@@ -398,15 +398,27 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 break
 
         if isinstance(payload, dict):
-            in_rate = payload.get("sample_rate", 48000)
-            in_codec = payload.get("codec", AudioCodec.PCM)
-            in_channels = payload.get("channels", 2)
-            in_bit_depth = payload.get("bit_depth", 16)
+            player_info = payload
+            if "payload" in player_info and isinstance(player_info["payload"], dict):
+                player_info = player_info["payload"]
+            if "player" in player_info and isinstance(player_info["player"], dict):
+                player_info = player_info["player"]
+
+            in_rate = player_info.get("sample_rate", 48000)
+            in_codec = player_info.get("codec", AudioCodec.PCM)
+            in_channels = player_info.get("channels", 2)
+            in_bit_depth = player_info.get("bit_depth", 16)
         else:
-            in_rate = getattr(payload, "sample_rate", 48000)
-            in_codec = getattr(payload, "codec", AudioCodec.PCM)
-            in_channels = getattr(payload, "channels", 2)
-            in_bit_depth = getattr(payload, "bit_depth", 16)
+            player_info = payload
+            if hasattr(player_info, "payload") and player_info.payload is not None:
+                player_info = player_info.payload
+            if hasattr(player_info, "player") and player_info.player is not None:
+                player_info = player_info.player
+
+            in_rate = getattr(player_info, "sample_rate", 48000)
+            in_codec = getattr(player_info, "codec", AudioCodec.PCM)
+            in_channels = getattr(player_info, "channels", 2)
+            in_bit_depth = getattr(player_info, "bit_depth", 16)
 
         self._stream = {
             "codec": in_codec,
