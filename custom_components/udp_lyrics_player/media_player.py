@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 import uuid
 from typing import Any
 
@@ -125,7 +126,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._listener_removers: list = []
 
         # Audio pipeline state — only touched by the single worker task.
-        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._audio_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue()
         self._udp_buffer: bytearray = bytearray()
         self._in_buffer: bytearray = bytearray()
         self._resampler: av.AudioResampler | None = None
@@ -297,7 +298,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         while True:
             try:
-                data = await self._audio_queue.get()
+                timestamp, data = await self._audio_queue.get()
 
                 if self._udp_sock is None:
                     continue
@@ -309,6 +310,17 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
                 if not pcm_out:
                     continue
+
+                # Synchronize playback to Server target play time
+                if self._sendspin is not None:
+                    try:
+                        target_client_time_us = self._sendspin.compute_play_time(int(timestamp))
+                        now_us = int(time.monotonic() * 1_000_000)
+                        delay_sec = (target_client_time_us - now_us) / 1_000_000.0
+                        if delay_sec > 0:
+                            await asyncio.sleep(delay_sec)
+                    except Exception as exc:
+                        _LOGGER.debug("Audio play timing error: %s", exc)
 
                 self._udp_buffer.extend(pcm_out)
 
@@ -441,7 +453,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     ) -> None:
         """Queue the incoming audio chunk for the worker to process."""
         if data and self._udp_sock is not None:
-            self._audio_queue.put_nowait(data)
+            self._audio_queue.put_nowait((int(timestamp), data))
 
     def _on_stream_end(self) -> None:
         """Flush the soxr resampler tail, send remaining buffer, clean up."""
