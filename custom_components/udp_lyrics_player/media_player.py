@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import socket
+import struct
 import time
 import uuid
 from typing import Any
@@ -62,6 +64,13 @@ _LOGGER = logging.getLogger(__name__)
 
 # UDP send chunk: 1024 frames * 2 bytes/frame = 2048 bytes.
 _UDP_SEND_CHUNK = 2048
+
+# RTP (RFC 3550) constants.
+# Payload type 96 is the first dynamic slot — used here for L16 mono 16 kHz.
+# The clock rate equals the audio sample rate (16 000 Hz), so the timestamp
+# increments by the number of PCM samples contained in each packet.
+_RTP_PAYLOAD_TYPE = 96
+_RTP_SAMPLES_PER_PACKET = _UDP_SEND_CHUNK // 2  # 1024 samples @ 16-bit mono
 
 
 # ── Platform setup ────────────────────────────────────────────────────────────
@@ -131,6 +140,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._in_buffer: bytearray = bytearray()
         self._resampler: av.AudioResampler | None = None
 
+        # RTP session state — reset on every stream_start.
+        # Initialised to zero here; _reset_rtp_state() assigns random values
+        # before the first packet is ever sent.
+        self._rtp_seq: int = 0
+        self._rtp_ts: int = 0
+        self._rtp_ssrc: int = 0
+        self._rtp_first_packet: bool = True
+
     # ── Device info ───────────────────────────────────────────────────────────
 
     @property
@@ -188,6 +205,65 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         if self._udp_sock:
             self._udp_sock.close()
             self._udp_sock = None
+
+    # ── RTP helpers ───────────────────────────────────────────────────────────
+
+    def _reset_rtp_state(self) -> None:
+        """Randomise RTP sequence number, timestamp, and SSRC for a new stream.
+
+        RFC 3550 §5.1 recommends random initial values so that streams are
+        harder to predict and multiple concurrent streams are distinguishable.
+        A fresh SSRC is chosen per stream so that the receiver sees a clean
+        synchronisation source each time.
+        """
+        self._rtp_seq = random.randint(0, 0xFFFF)
+        self._rtp_ts = random.randint(0, 0xFFFFFFFF)
+        self._rtp_ssrc = random.randint(1, 0xFFFFFFFF)  # 0 is reserved
+        self._rtp_first_packet = True
+
+    def _make_rtp_packet(self, payload: bytes) -> bytes:
+        """Prepend a 12-byte RTP header (RFC 3550) to *payload* and return the
+        resulting packet.
+
+        Header layout (network byte order)::
+
+             0                   1                   2                   3
+             0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |V=2|P|X|  CC   |M|     PT      |       sequence number         |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |                           timestamp                           |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |           synchronization source (SSRC) identifier           |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+        * V=2, P=0, X=0, CC=0  → first byte is always 0x80.
+        * Marker bit is set on the very first packet of a stream (talk-spurt
+          start), then cleared for the remainder per RFC 3551 §4.1.
+        * Payload type 96 (dynamic) for L16 mono 16 kHz.
+        * Timestamp clock runs at the audio sample rate (16 000 Hz); it is
+          advanced by the number of PCM samples contained in *payload*.
+        * Sequence number wraps at 65 535 → 0 as required by the RFC.
+        """
+        marker = 1 if self._rtp_first_packet else 0
+        self._rtp_first_packet = False
+
+        header = struct.pack(
+            "!BBHII",
+            0x80,                            # V=2, P=0, X=0, CC=0
+            (marker << 7) | _RTP_PAYLOAD_TYPE,
+            self._rtp_seq & 0xFFFF,
+            self._rtp_ts & 0xFFFFFFFF,
+            self._rtp_ssrc,
+        )
+
+        # Advance counters *after* building the header so the values written
+        # above match what the receiver will decode for this packet.
+        self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
+        # Each s16 mono sample is 2 bytes; advance timestamp by sample count.
+        self._rtp_ts = (self._rtp_ts + len(payload) // 2) & 0xFFFFFFFF
+
+        return header + payload
 
     # ── Sendspin connection ───────────────────────────────────────────────────
 
@@ -324,11 +400,11 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
                 self._udp_buffer.extend(pcm_out)
 
-                # Drain buffer in _UDP_SEND_CHUNK-sized packets
+                # Drain buffer in _UDP_SEND_CHUNK-sized RTP packets
                 while len(self._udp_buffer) >= _UDP_SEND_CHUNK:
                     chunk = bytes(self._udp_buffer[:_UDP_SEND_CHUNK])
                     del self._udp_buffer[:_UDP_SEND_CHUNK]
-                    self._udp_sock.sendto(chunk, dest)
+                    self._udp_sock.sendto(self._make_rtp_packet(chunk), dest)
 
             except asyncio.CancelledError:
                 break
@@ -444,6 +520,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             format="s16", layout="mono", rate=UDP_AUDIO_SAMPLE_RATE
         )
 
+        # New stream → new RTP session (fresh sequence number, timestamp, SSRC)
+        self._reset_rtp_state()
+
         _LOGGER.debug("Sendspin stream started: %s", self._stream)
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
@@ -470,11 +549,13 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 _LOGGER.debug("Resampler flush error: %s", exc)
             self._resampler = None
 
-        # Send whatever remains in the UDP buffer
+        # Send whatever remains in the UDP buffer as a final RTP packet
         if self._udp_buffer and self._udp_sock is not None:
             try:
                 dest = (self._udp_host, self._udp_port)
-                self._udp_sock.sendto(bytes(self._udp_buffer), dest)
+                self._udp_sock.sendto(
+                    self._make_rtp_packet(bytes(self._udp_buffer)), dest
+                )
             except Exception as exc:
                 _LOGGER.debug("UDP flush error: %s", exc)
         self._udp_buffer.clear()
