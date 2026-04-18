@@ -3,7 +3,7 @@
 A Home Assistant custom component that creates a Sendspin-compatible dummy media player. 
 
 ## What does it do?
-This component impersonates a network speaker on your system. It is designed to join a normal audio group alongside your real hardware speakers. Once grouped, it receives the playing audio , downsamples to 16kHz Mono and forwards this audio over a configurable UDP port to the synclyrics integration.
+This component impersonates a network speaker on your system. It is designed to join a normal audio group alongside your real hardware speakers. Once grouped, it receives the playing audio, downsamples to 16kHz mono, encapsulates it as RTP/L16, and forwards it over a configurable UDP port to the synclyrics integration.
 
 ## Why use it?
 This player is purpose-built to provide a stable, synchronised audio stream to the [SyncLyrics Add-on](https://github.com/AnshulJ999/SyncLyrics). 
