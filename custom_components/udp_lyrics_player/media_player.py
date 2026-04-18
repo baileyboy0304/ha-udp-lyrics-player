@@ -72,6 +72,19 @@ _UDP_SEND_CHUNK = 2048
 _RTP_PAYLOAD_TYPE = 96
 _RTP_SAMPLES_PER_PACKET = _UDP_SEND_CHUNK // 2  # 1024 samples @ 16-bit mono
 
+# Wall-clock duration represented by one RTP packet — drives output pacing.
+# 1024 samples / 16000 Hz = 64 000 µs.
+_PACKET_DURATION_US = (
+    1_000_000 * _RTP_SAMPLES_PER_PACKET // UDP_AUDIO_SAMPLE_RATE
+)
+
+# Queue bounds: ~6 s of 25 ms input chunks. Beyond this we drop the oldest
+# chunk so a transient stall cannot turn into permanent latency.
+_QUEUE_MAX = 256
+
+# Drop chunks whose scheduled play time is already this far in the past.
+_STALE_DROP_THRESHOLD_US = 1_000_000
+
 
 # ── Platform setup ────────────────────────────────────────────────────────────
 
@@ -135,10 +148,21 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._listener_removers: list = []
 
         # Audio pipeline state — only touched by the single worker task.
-        self._audio_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue()
+        self._audio_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(
+            maxsize=_QUEUE_MAX
+        )
         self._udp_buffer: bytearray = bytearray()
         self._in_buffer: bytearray = bytearray()
         self._resampler: av.AudioResampler | None = None
+        self._passthrough: bool = False
+
+        # Output-clock state. `_next_send_time_us` is the monotonic wall time
+        # at which the next RTP packet should leave the socket. It is set once
+        # per stream from compute_play_time() on the first chunk, then advanced
+        # by _PACKET_DURATION_US per packet — so the output rate is governed
+        # purely by the audio clock, not by when input chunks arrive.
+        self._next_send_time_us: int | None = None
+        self._first_chunk_ts_us: int | None = None
 
         # RTP session state — reset on every stream_start.
         # Initialised to zero here; _reset_rtp_state() assigns random values
@@ -313,6 +337,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             self._sendspin.add_stream_start_listener(self._on_stream_start),
             self._sendspin.add_audio_chunk_listener(self._on_audio_chunk),
             self._sendspin.add_stream_end_listener(self._on_stream_end),
+            self._sendspin.add_stream_clear_listener(self._on_stream_clear),
             self._sendspin.add_group_update_listener(self._on_group_update),
             self._sendspin.add_metadata_listener(self._on_metadata),
             self._sendspin.add_server_command_listener(self._on_server_command),
@@ -366,8 +391,13 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     async def _audio_worker_loop(self) -> None:
         """Process audio chunks one-by-one in strict chronological order.
 
-        A single worker task drains the queue so that _udp_buffer and
-        _resampler are never accessed concurrently.
+        Pacing model: the first RTP packet of a stream is gated on
+        ``compute_play_time()`` of that stream's first chunk (so it leaves
+        the socket at the server's scheduled playback moment). Every packet
+        afterwards is released exactly ``_PACKET_DURATION_US`` later,
+        regardless of when its source chunk arrived. That way the output
+        rate is fixed to the audio clock and input-side jitter cannot pull
+        the stream behind real time.
         """
         loop = asyncio.get_event_loop()
         dest = (self._udp_host, self._udp_port)
@@ -379,7 +409,32 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 if self._udp_sock is None:
                     continue
 
-                # Decode, mix to mono, resample — all in an executor thread
+                # Overload policy: drop chunks whose scheduled play time is
+                # already more than _STALE_DROP_THRESHOLD_US in the past.
+                # Without this the worker can never catch up once it falls
+                # behind, because every subsequent chunk inherits the lag.
+                if self._sendspin is not None:
+                    try:
+                        target_us = self._sendspin.compute_play_time(int(timestamp))
+                        now_us = int(time.monotonic() * 1_000_000)
+                        if target_us + _STALE_DROP_THRESHOLD_US < now_us:
+                            _LOGGER.debug(
+                                "Dropping stale audio chunk (%.2fs behind)",
+                                (now_us - target_us) / 1_000_000.0,
+                            )
+                            # Reset the output clock so the next accepted
+                            # chunk re-anchors on a fresh compute_play_time.
+                            self._next_send_time_us = None
+                            self._first_chunk_ts_us = None
+                            self._udp_buffer.clear()
+                            continue
+                    except Exception:
+                        pass
+
+                if self._first_chunk_ts_us is None:
+                    self._first_chunk_ts_us = int(timestamp)
+
+                # Decode, mix to mono, resample — all in an executor thread.
                 pcm_out: bytes = await loop.run_in_executor(
                     None, self._process_chunk, data
                 )
@@ -387,23 +442,44 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 if not pcm_out:
                     continue
 
-                # Synchronize playback to Server target play time
-                if self._sendspin is not None:
-                    try:
-                        target_client_time_us = self._sendspin.compute_play_time(int(timestamp))
-                        now_us = int(time.monotonic() * 1_000_000)
-                        delay_sec = (target_client_time_us - now_us) / 1_000_000.0
-                        if delay_sec > 0:
-                            await asyncio.sleep(delay_sec)
-                    except Exception as exc:
-                        _LOGGER.debug("Audio play timing error: %s", exc)
-
                 self._udp_buffer.extend(pcm_out)
 
-                # Drain buffer in _UDP_SEND_CHUNK-sized RTP packets
+                # Drain buffer in _UDP_SEND_CHUNK-sized RTP packets, paced
+                # by the monotonic audio clock.
                 while len(self._udp_buffer) >= _UDP_SEND_CHUNK:
                     chunk = bytes(self._udp_buffer[:_UDP_SEND_CHUNK])
                     del self._udp_buffer[:_UDP_SEND_CHUNK]
+
+                    if self._next_send_time_us is None:
+                        # Start-gate: wait until the server's scheduled play
+                        # time for this stream before releasing the first
+                        # packet. After this, input-side timestamps are not
+                        # consulted again.
+                        start_us: int
+                        if self._sendspin is not None:
+                            try:
+                                start_us = self._sendspin.compute_play_time(
+                                    int(self._first_chunk_ts_us or timestamp)
+                                )
+                            except Exception:
+                                start_us = int(time.monotonic() * 1_000_000)
+                        else:
+                            start_us = int(time.monotonic() * 1_000_000)
+
+                        now_us = int(time.monotonic() * 1_000_000)
+                        delay_sec = (start_us - now_us) / 1_000_000.0
+                        if delay_sec > 0:
+                            await asyncio.sleep(delay_sec)
+                        self._next_send_time_us = max(
+                            start_us, int(time.monotonic() * 1_000_000)
+                        )
+                    else:
+                        self._next_send_time_us += _PACKET_DURATION_US
+                        now_us = int(time.monotonic() * 1_000_000)
+                        delay_sec = (self._next_send_time_us - now_us) / 1_000_000.0
+                        if delay_sec > 0:
+                            await asyncio.sleep(delay_sec)
+
                     self._udp_sock.sendto(self._make_rtp_packet(chunk), dest)
 
             except asyncio.CancelledError:
@@ -416,9 +492,6 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         Called from an executor thread by the single worker task.
         """
-        if self._resampler is None:
-            return b""
-
         in_rate = self._stream.get("sample_rate", 48000)
         in_channels = self._stream.get("channels", 2)
         in_bit_depth = self._stream.get("bit_depth", 16)
@@ -436,11 +509,11 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         layout = 'stereo' if in_channels == 2 else 'mono'
         frame_size = bytes_per_sample * in_channels
-        
+
         # Buffer incoming incomplete frames
         if data:
             self._in_buffer.extend(data)
-            
+
         samples = len(self._in_buffer) // frame_size
 
         if samples == 0:
@@ -449,6 +522,15 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         bytes_to_consume = samples * frame_size
         chunk_data = bytes(self._in_buffer[:bytes_to_consume])
         del self._in_buffer[:bytes_to_consume]
+
+        # Fast path: the server is already producing the exact target format
+        # the UDP receiver expects (16 kHz / mono / s16le). PyAV adds no value
+        # here and resampling would introduce tiny ramp-up delays, so skip it.
+        if self._passthrough:
+            return chunk_data
+
+        if self._resampler is None:
+            return b""
 
         try:
             # 1. Create PyAV frame using only completely aligned frames
@@ -477,6 +559,8 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         """Store stream format metadata and create the PyAV resampler."""
         self._udp_buffer.clear()
         self._in_buffer.clear()
+        self._next_send_time_us = None
+        self._first_chunk_ts_us = None
 
         # Drain stale chunks from a previous stream
         while not self._audio_queue.empty():
@@ -515,10 +599,20 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             "bit_depth": in_bit_depth,
         }
 
-        # Create a fresh PyAV streaming resampler
-        self._resampler = av.AudioResampler(
-            format="s16", layout="mono", rate=UDP_AUDIO_SAMPLE_RATE
+        # If the server is already emitting our target format we can skip
+        # PyAV entirely — both cheaper and avoids the resampler's ramp-up.
+        self._passthrough = (
+            in_rate == UDP_AUDIO_SAMPLE_RATE
+            and in_channels == UDP_AUDIO_CHANNELS
+            and in_bit_depth == UDP_AUDIO_BIT_DEPTH
         )
+
+        if self._passthrough:
+            self._resampler = None
+        else:
+            self._resampler = av.AudioResampler(
+                format="s16", layout="mono", rate=UDP_AUDIO_SAMPLE_RATE
+            )
 
         # New stream → new RTP session (fresh sequence number, timestamp, SSRC)
         self._reset_rtp_state()
@@ -531,8 +625,22 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self, timestamp: float, data: bytes, audio_format: Any = None
     ) -> None:
         """Queue the incoming audio chunk for the worker to process."""
-        if data and self._udp_sock is not None:
+        if not (data and self._udp_sock is not None):
+            return
+        try:
             self._audio_queue.put_nowait((int(timestamp), data))
+        except asyncio.QueueFull:
+            # Queue overflow → the worker has fallen behind. Drop the oldest
+            # chunk to release the bound, then enqueue the fresh one so the
+            # backlog never grows without bound.
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._audio_queue.put_nowait((int(timestamp), data))
+            except asyncio.QueueFull:
+                pass
 
     def _on_stream_end(self) -> None:
         """Flush the soxr resampler tail, send remaining buffer, clean up."""
@@ -561,6 +669,36 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._udp_buffer.clear()
         self._in_buffer.clear()
         self._stream = {}
+        self._passthrough = False
+        self._next_send_time_us = None
+        self._first_chunk_ts_us = None
+
+    def _on_stream_clear(self, roles: list[str] | None = None) -> None:
+        """Handle stream/clear — server asked the pipeline to drop everything.
+
+        Unlike stream_end this can fire mid-track (group changes, track skip,
+        server flush). We drop any queued / buffered audio and reset the
+        output clock so the next stream_start re-gates cleanly.
+        """
+        _LOGGER.debug("Sendspin stream cleared (roles=%s)", roles)
+
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        self._udp_buffer.clear()
+        self._in_buffer.clear()
+        self._next_send_time_us = None
+        self._first_chunk_ts_us = None
+        if self._resampler is not None:
+            try:
+                # Flush and discard the resampler tail so it does not leak
+                # into the next stream.
+                self._resampler.resample(None)
+            except Exception:
+                pass
 
     def _on_group_update(self, state: Any) -> None:
         """Sync HA state with the Sendspin group playback state."""
