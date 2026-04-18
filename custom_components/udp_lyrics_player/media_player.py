@@ -147,6 +147,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._worker_task: asyncio.Task | None = None
         self._listener_removers: list = []
 
+        # Throughput diagnostics — periodically log chunks in vs packets out
+        # so pacing problems can be distinguished from input starvation.
+        self._stats_start_us: int | None = None
+        self._stats_chunks_in: int = 0
+        self._stats_packets_out: int = 0
+        self._stats_process_us: int = 0
+        self._stats_last_log_us: int = 0
+
         # Audio pipeline state — only touched by the single worker task.
         self._audio_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(
             maxsize=_QUEUE_MAX
@@ -435,9 +443,18 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     self._first_chunk_ts_us = int(timestamp)
 
                 # Decode, mix to mono, resample — all in an executor thread.
+                proc_start_us = int(time.monotonic() * 1_000_000)
                 pcm_out: bytes = await loop.run_in_executor(
                     None, self._process_chunk, data
                 )
+                proc_elapsed_us = int(time.monotonic() * 1_000_000) - proc_start_us
+
+                # Throughput diagnostics
+                if self._stats_start_us is None:
+                    self._stats_start_us = int(time.monotonic() * 1_000_000)
+                    self._stats_last_log_us = self._stats_start_us
+                self._stats_chunks_in += 1
+                self._stats_process_us += proc_elapsed_us
 
                 if not pcm_out:
                     continue
@@ -481,6 +498,30 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                             await asyncio.sleep(delay_sec)
 
                     self._udp_sock.sendto(self._make_rtp_packet(chunk), dest)
+                    self._stats_packets_out += 1
+
+                # Log throughput every 5s so input-vs-output rate is visible
+                # without needing an external capture.
+                now_stats_us = int(time.monotonic() * 1_000_000)
+                if now_stats_us - self._stats_last_log_us >= 5_000_000:
+                    elapsed_us = now_stats_us - (self._stats_start_us or now_stats_us)
+                    if elapsed_us > 0 and self._stats_chunks_in > 0:
+                        avg_proc_ms = (
+                            self._stats_process_us / self._stats_chunks_in / 1000.0
+                        )
+                        in_rate = self._stats_chunks_in * 1_000_000 / elapsed_us
+                        out_rate = self._stats_packets_out * 1_000_000 / elapsed_us
+                        _LOGGER.info(
+                            "UDP pacing: in=%.1f chunks/s out=%.1f pkts/s "
+                            "avg_proc=%.1fms buffer=%dB queue=%d passthrough=%s",
+                            in_rate,
+                            out_rate,
+                            avg_proc_ms,
+                            len(self._udp_buffer),
+                            self._audio_queue.qsize(),
+                            self._passthrough,
+                        )
+                    self._stats_last_log_us = now_stats_us
 
             except asyncio.CancelledError:
                 break
@@ -561,6 +602,12 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._in_buffer.clear()
         self._next_send_time_us = None
         self._first_chunk_ts_us = None
+        # Reset throughput stats so the first log line reflects this stream.
+        self._stats_start_us = None
+        self._stats_chunks_in = 0
+        self._stats_packets_out = 0
+        self._stats_process_us = 0
+        self._stats_last_log_us = 0
 
         # Drain stale chunks from a previous stream
         while not self._audio_queue.empty():
@@ -617,7 +664,11 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # New stream → new RTP session (fresh sequence number, timestamp, SSRC)
         self._reset_rtp_state()
 
-        _LOGGER.debug("Sendspin stream started: %s", self._stream)
+        _LOGGER.info(
+            "Sendspin stream started: %s passthrough=%s",
+            self._stream,
+            self._passthrough,
+        )
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
 
