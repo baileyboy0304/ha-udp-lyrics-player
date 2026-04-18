@@ -154,6 +154,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._stats_packets_out: int = 0
         self._stats_process_us: int = 0
         self._stats_last_log_us: int = 0
+        self._stats_bytes_in: int = 0
+        self._stats_audio_us_in: int = 0
+        self._stats_last_ts_us: int | None = None
 
         # Audio pipeline state — only touched by the single worker task.
         self._audio_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(
@@ -459,6 +462,12 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     self._stats_last_log_us = self._stats_start_us
                 self._stats_chunks_in += 1
                 self._stats_process_us += proc_elapsed_us
+                self._stats_bytes_in += len(data)
+                if self._stats_last_ts_us is not None:
+                    ts_delta = int(timestamp) - self._stats_last_ts_us
+                    if 0 < ts_delta < 1_000_000:
+                        self._stats_audio_us_in += ts_delta
+                self._stats_last_ts_us = int(timestamp)
 
                 if not pcm_out:
                     continue
@@ -515,12 +524,19 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                         )
                         in_rate = self._stats_chunks_in * 1_000_000 / elapsed_us
                         out_rate = self._stats_packets_out * 1_000_000 / elapsed_us
+                        avg_chunk_bytes = (
+                            self._stats_bytes_in / self._stats_chunks_in
+                        )
+                        audio_ratio = self._stats_audio_us_in / elapsed_us
                         _LOGGER.info(
                             "UDP pacing: in=%.1f chunks/s out=%.1f pkts/s "
-                            "avg_proc=%.1fms buffer=%dB queue=%d passthrough=%s",
+                            "avg_proc=%.1fms avg_chunk=%.0fB audio_in/realtime=%.2fx "
+                            "buffer=%dB queue=%d passthrough=%s",
                             in_rate,
                             out_rate,
                             avg_proc_ms,
+                            avg_chunk_bytes,
+                            audio_ratio,
                             len(self._udp_buffer),
                             self._audio_queue.qsize(),
                             self._passthrough,
@@ -612,6 +628,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._stats_packets_out = 0
         self._stats_process_us = 0
         self._stats_last_log_us = 0
+        self._stats_bytes_in = 0
+        self._stats_audio_us_in = 0
+        self._stats_last_ts_us = None
 
         # Drain stale chunks from a previous stream
         while not self._audio_queue.empty():
