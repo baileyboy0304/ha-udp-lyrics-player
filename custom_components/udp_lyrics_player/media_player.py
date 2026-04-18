@@ -324,7 +324,11 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         player_support = ClientHelloPlayerSupport(
             supported_formats=supported_formats,
-            buffer_capacity=512 * 1024,
+            # Match the reference sendspin-cli player. A small capacity makes
+            # the server's BufferTracker block sends once ~half a second of
+            # audio is in flight, which throttles our input rate far below
+            # real time. HA is not memory-constrained, so mirror the CLI.
+            buffer_capacity=32_000_000,
             supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
         )
 
