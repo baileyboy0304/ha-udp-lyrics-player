@@ -16,11 +16,11 @@ Sendspin server  →  aiosendspin client  →  av.AudioFrame   →  PyAV resampl
 from __future__ import annotations
 
 import asyncio
+import audioop
 import logging
 import random
 import socket
 import struct
-import time
 import uuid
 from typing import Any
 
@@ -147,6 +147,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._rtp_ts: int = 0
         self._rtp_ssrc: int = 0
         self._rtp_first_packet: bool = True
+        self._playback_anchor_set: bool = False
 
     # ── Device info ───────────────────────────────────────────────────────────
 
@@ -387,14 +388,17 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 if not pcm_out:
                     continue
 
-                # Synchronize playback to Server target play time
-                if self._sendspin is not None:
+                # Synchronize playback to server target play time.
+                # We only do this once per stream to establish the playback
+                # anchor and avoid compounding drift with per-chunk sleeps.
+                if self._sendspin is not None and not self._playback_anchor_set:
                     try:
                         target_client_time_us = self._sendspin.compute_play_time(int(timestamp))
-                        now_us = int(time.monotonic() * 1_000_000)
+                        now_us = int(self._sendspin.now_us())
                         delay_sec = (target_client_time_us - now_us) / 1_000_000.0
                         if delay_sec > 0:
                             await asyncio.sleep(delay_sec)
+                        self._playback_anchor_set = True
                     except Exception as exc:
                         _LOGGER.debug("Audio play timing error: %s", exc)
 
@@ -459,11 +463,13 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             # 2. Resample to target format
             out_frames = self._resampler.resample(frame)
 
-            # 3. Extract s16le bytes
+            # 3. Extract PCM bytes and convert to network byte order.
+            # RTP L16 (RFC 3551) requires big-endian sample encoding.
             out_bytes = bytearray()
             for out in out_frames:
                 # s16 mono = 2 bytes per sample
                 b = bytes(out.planes[0])[: out.samples * 2]
+                b = audioop.byteswap(b, 2)
                 out_bytes.extend(b)
 
             return bytes(out_bytes)
@@ -522,6 +528,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         # New stream → new RTP session (fresh sequence number, timestamp, SSRC)
         self._reset_rtp_state()
+        self._playback_anchor_set = False
 
         _LOGGER.debug("Sendspin stream started: %s", self._stream)
         self._attr_state = MediaPlayerState.PLAYING
@@ -544,6 +551,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 tail_frames = self._resampler.resample(None)
                 for out in tail_frames:
                     b = bytes(out.planes[0])[: out.samples * 2]
+                    b = audioop.byteswap(b, 2)
                     self._udp_buffer.extend(b)
             except Exception as exc:
                 _LOGGER.debug("Resampler flush error: %s", exc)
@@ -680,5 +688,3 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             except Exception as exc:
                 _LOGGER.debug("send_player_state error: %s", exc)
         self.async_write_ha_state()
-
-
