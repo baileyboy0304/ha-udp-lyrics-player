@@ -289,13 +289,16 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     async def _run_sendspin(self) -> None:
         """Connect to the Sendspin server and keep the connection alive."""
+        # Format priority: ask the server for the SOURCE format first so it
+        # can passthrough without transcoding. Earlier we put 16 kHz mono
+        # first, which forced the server to decode → resample → downmix →
+        # re-encode every chunk. That transcode could not keep up with real
+        # time, so the server dropped chunks via _check_late_binary, leaving
+        # us with only ~42 % of the audio bytes (ffmpeg saw speed=0.444x).
+        # The reference sendspin-cli player never asks for 16 kHz mono — it
+        # advertises native rates only. We resample 48k stereo → 16k mono
+        # client-side in _process_chunk (PyAV soxr), which is cheap.
         supported_formats = [
-            SupportedAudioFormat(
-                codec=AudioCodec.PCM,
-                sample_rate=UDP_AUDIO_SAMPLE_RATE,
-                bit_depth=UDP_AUDIO_BIT_DEPTH,
-                channels=UDP_AUDIO_CHANNELS,
-            ),
             SupportedAudioFormat(
                 codec=AudioCodec.PCM,
                 sample_rate=48000,
@@ -307,6 +310,12 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 sample_rate=44100,
                 bit_depth=16,
                 channels=2,
+            ),
+            SupportedAudioFormat(
+                codec=AudioCodec.PCM,
+                sample_rate=UDP_AUDIO_SAMPLE_RATE,
+                bit_depth=UDP_AUDIO_BIT_DEPTH,
+                channels=UDP_AUDIO_CHANNELS,
             ),
         ]
 
