@@ -16,6 +16,7 @@ Sendspin server  →  aiosendspin client  →  av.AudioFrame   →  PyAV resampl
 from __future__ import annotations
 
 import asyncio
+import audioop
 import logging
 import random
 import socket
@@ -467,6 +468,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             for out in out_frames:
                 # s16 mono = 2 bytes per sample
                 b = bytes(out.planes[0])[: out.samples * 2]
+                b = audioop.byteswap(b, 2)
                 out_bytes.extend(b)
 
             return bytes(out_bytes)
@@ -548,6 +550,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 tail_frames = self._resampler.resample(None)
                 for out in tail_frames:
                     b = bytes(out.planes[0])[: out.samples * 2]
+                    b = audioop.byteswap(b, 2)
                     self._udp_buffer.extend(b)
             except Exception as exc:
                 _LOGGER.debug("Resampler flush error: %s", exc)
