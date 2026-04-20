@@ -71,6 +71,12 @@ _UDP_SEND_CHUNK = 2048
 # increments by the number of PCM samples contained in each packet.
 _RTP_PAYLOAD_TYPE = 96
 _RTP_SAMPLES_PER_PACKET = _UDP_SEND_CHUNK // 2  # 1024 samples @ 16-bit mono
+_RTP_EXT_PROFILE_ONE_BYTE = 0xBEDE
+_RTP_EXT_PROFILE_TWO_BYTE = 0x1000
+_RTP_EXT_ID_MA_PLAYER_NAME = 1
+_RTP_EXT_ID_MA_PLAYER_ID = 2
+_RTP_EXT_BURST_PACKET_COUNT = 5
+_RTP_EXT_HEARTBEAT_SECONDS = 2.0
 
 
 # ── Platform setup ────────────────────────────────────────────────────────────
@@ -147,6 +153,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._rtp_ts: int = 0
         self._rtp_ssrc: int = 0
         self._rtp_first_packet: bool = True
+        self._rtp_packets_sent: int = 0
+        self._rtp_next_ext_heartbeat_monotonic: float = 0.0
+        self._rtp_player_name_bytes: bytes = b""
+        self._rtp_player_id_bytes: bytes = b""
 
     # ── Device info ───────────────────────────────────────────────────────────
 
@@ -220,6 +230,68 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._rtp_ts = random.randint(0, 0xFFFFFFFF)
         self._rtp_ssrc = random.randint(1, 0xFFFFFFFF)  # 0 is reserved
         self._rtp_first_packet = True
+        self._rtp_packets_sent = 0
+        self._rtp_next_ext_heartbeat_monotonic = (
+            time.monotonic() + _RTP_EXT_HEARTBEAT_SECONDS
+        )
+        self._rtp_player_name_bytes = self._encode_utf8_at_char_boundary(
+            self._player_name, 255
+        )
+        self._rtp_player_id_bytes = self._encode_utf8_at_char_boundary(
+            self._client_id, 255
+        )
+
+    def _encode_utf8_at_char_boundary(self, text: str, max_bytes: int) -> bytes:
+        """UTF-8 encode *text* and truncate to *max_bytes* without splitting characters."""
+        if max_bytes <= 0:
+            return b""
+        out = bytearray()
+        for ch in text:
+            encoded = ch.encode("utf-8")
+            if len(out) + len(encoded) > max_bytes:
+                break
+            out.extend(encoded)
+        return bytes(out)
+
+    def _build_rtp_extension(self, elements: list[tuple[int, bytes]]) -> bytes:
+        """Build RFC 8285 one-byte or two-byte RTP header extension payload."""
+        valid = [
+            (ext_id, data)
+            for ext_id, data in elements
+            if 1 <= ext_id <= 14 and 1 <= len(data) <= 255
+        ]
+        if not valid:
+            return b""
+
+        use_two_byte_form = any(len(data) > 16 for _, data in valid)
+        body = bytearray()
+        if use_two_byte_form:
+            for ext_id, data in valid:
+                body.append(ext_id)
+                body.append(len(data))
+                body.extend(data)
+            profile = _RTP_EXT_PROFILE_TWO_BYTE
+        else:
+            for ext_id, data in valid:
+                body.append((ext_id << 4) | (len(data) - 1))
+                body.extend(data)
+            profile = _RTP_EXT_PROFILE_ONE_BYTE
+
+        while len(body) % 4:
+            body.append(0x00)
+        return struct.pack("!HH", profile, len(body) // 4) + bytes(body)
+
+    def _should_send_rtp_extension(self) -> bool:
+        """Send extension in initial burst and then heartbeat cadence."""
+        if self._rtp_packets_sent < _RTP_EXT_BURST_PACKET_COUNT:
+            return True
+        now = time.monotonic()
+        if now >= self._rtp_next_ext_heartbeat_monotonic:
+            self._rtp_next_ext_heartbeat_monotonic = (
+                now + _RTP_EXT_HEARTBEAT_SECONDS
+            )
+            return True
+        return False
 
     def _make_rtp_packet(self, payload: bytes) -> bytes:
         """Prepend a 12-byte RTP header (RFC 3550) to *payload* and return the
@@ -237,7 +309,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             |           synchronization source (SSRC) identifier           |
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-        * V=2, P=0, X=0, CC=0  → first byte is always 0x80.
+        * V=2, P=0, CC=0 with optional X when metadata extension is present.
         * Marker bit is set on the very first packet of a stream (talk-spurt
           start), then cleared for the remainder per RFC 3551 §4.1.
         * Payload type 96 (dynamic) for L16 mono 16 kHz.
@@ -247,10 +319,21 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         """
         marker = 1 if self._rtp_first_packet else 0
         self._rtp_first_packet = False
+        include_extension = self._should_send_rtp_extension()
+        ext = b""
+        if include_extension:
+            ext = self._build_rtp_extension(
+                [
+                    (_RTP_EXT_ID_MA_PLAYER_NAME, self._rtp_player_name_bytes),
+                    (_RTP_EXT_ID_MA_PLAYER_ID, self._rtp_player_id_bytes),
+                ]
+            )
+            if not ext:
+                include_extension = False
 
         header = struct.pack(
             "!BBHII",
-            0x80,                            # V=2, P=0, X=0, CC=0
+            0x80 | (0x10 if include_extension else 0x00),
             (marker << 7) | _RTP_PAYLOAD_TYPE,
             self._rtp_seq & 0xFFFF,
             self._rtp_ts & 0xFFFFFFFF,
@@ -262,8 +345,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
         # Each s16 mono sample is 2 bytes; advance timestamp by sample count.
         self._rtp_ts = (self._rtp_ts + len(payload) // 2) & 0xFFFFFFFF
+        self._rtp_packets_sent += 1
 
-        return header + payload
+        return header + ext + payload
 
     # ── Sendspin connection ───────────────────────────────────────────────────
 
@@ -680,5 +764,3 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             except Exception as exc:
                 _LOGGER.debug("send_player_state error: %s", exc)
         self.async_write_ha_state()
-
-
