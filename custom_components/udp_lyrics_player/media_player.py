@@ -418,6 +418,8 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     "UDP Lyrics Player '%s' connected to Sendspin",
                     self._player_name,
                 )
+                while self._sendspin is not None and self._sendspin.connected:
+                    await asyncio.sleep(1)
             except asyncio.CancelledError:
                 reconnect = False
                 raise
@@ -429,11 +431,11 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     exc,
                 )
             finally:
+                await self._teardown_sendspin()
                 self._attr_state = MediaPlayerState.IDLE
                 self._stream_active = False
                 self._clear_audio_pipeline()
                 self.async_write_ha_state()
-                await self._teardown_sendspin()
 
             if not reconnect:
                 break
