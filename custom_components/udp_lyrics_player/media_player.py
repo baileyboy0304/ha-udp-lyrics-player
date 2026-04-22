@@ -77,6 +77,7 @@ _RTP_EXT_ID_MA_PLAYER_NAME = 1
 _RTP_EXT_ID_MA_PLAYER_ID = 2
 _RTP_EXT_BURST_PACKET_COUNT = 5
 _RTP_EXT_HEARTBEAT_SECONDS = 2.0
+_RECONNECT_DELAY_SECONDS = 5.0
 
 
 # ── Platform setup ────────────────────────────────────────────────────────────
@@ -136,6 +137,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._sendspin: SendspinClient | None = None
         self._udp_sock: socket.socket | None = None
         self._stream: dict[str, Any] = {}
+        self._stream_active: bool = False
         self._connect_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._listener_removers: list = []
@@ -353,78 +355,95 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     async def _run_sendspin(self) -> None:
         """Connect to the Sendspin server and keep the connection alive."""
-        supported_formats = [
-            SupportedAudioFormat(
-                codec=AudioCodec.PCM,
-                sample_rate=UDP_AUDIO_SAMPLE_RATE,
-                bit_depth=UDP_AUDIO_BIT_DEPTH,
-                channels=UDP_AUDIO_CHANNELS,
-            ),
-            SupportedAudioFormat(
-                codec=AudioCodec.PCM,
-                sample_rate=48000,
-                bit_depth=16,
-                channels=2,
-            ),
-            SupportedAudioFormat(
-                codec=AudioCodec.PCM,
-                sample_rate=44100,
-                bit_depth=16,
-                channels=2,
-            ),
-        ]
+        while True:
+            supported_formats = [
+                SupportedAudioFormat(
+                    codec=AudioCodec.PCM,
+                    sample_rate=UDP_AUDIO_SAMPLE_RATE,
+                    bit_depth=UDP_AUDIO_BIT_DEPTH,
+                    channels=UDP_AUDIO_CHANNELS,
+                ),
+                SupportedAudioFormat(
+                    codec=AudioCodec.PCM,
+                    sample_rate=48000,
+                    bit_depth=16,
+                    channels=2,
+                ),
+                SupportedAudioFormat(
+                    codec=AudioCodec.PCM,
+                    sample_rate=44100,
+                    bit_depth=16,
+                    channels=2,
+                ),
+            ]
 
-        player_support = ClientHelloPlayerSupport(
-            supported_formats=supported_formats,
-            buffer_capacity=512 * 1024,
-            supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
-        )
+            player_support = ClientHelloPlayerSupport(
+                supported_formats=supported_formats,
+                buffer_capacity=512 * 1024,
+                supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+            )
 
-        self._sendspin = SendspinClient(
-            client_id=self._client_id,
-            client_name=self._player_name,
-            roles=[Roles.PLAYER],
-            player_support=player_support,
-            device_info=DeviceInfo(
-                manufacturer="Music Companion",
-                software_version="1.0.0",
-            ),
-            initial_volume=int(self._attr_volume_level * 100),
-            initial_muted=self._attr_is_volume_muted,
-        )
+            self._sendspin = SendspinClient(
+                client_id=self._client_id,
+                client_name=self._player_name,
+                roles=[Roles.PLAYER],
+                player_support=player_support,
+                device_info=DeviceInfo(
+                    manufacturer="Music Companion",
+                    software_version="1.0.0",
+                ),
+                initial_volume=int(self._attr_volume_level * 100),
+                initial_muted=self._attr_is_volume_muted,
+            )
 
-        self._listener_removers = [
-            self._sendspin.add_stream_start_listener(self._on_stream_start),
-            self._sendspin.add_audio_chunk_listener(self._on_audio_chunk),
-            self._sendspin.add_stream_end_listener(self._on_stream_end),
-            self._sendspin.add_group_update_listener(self._on_group_update),
-            self._sendspin.add_metadata_listener(self._on_metadata),
-            self._sendspin.add_server_command_listener(self._on_server_command),
-            self._sendspin.add_disconnect_listener(self._on_disconnect),
-        ]
+            self._listener_removers = [
+                self._sendspin.add_stream_start_listener(self._on_stream_start),
+                self._sendspin.add_audio_chunk_listener(self._on_audio_chunk),
+                self._sendspin.add_stream_end_listener(self._on_stream_end),
+                self._sendspin.add_group_update_listener(self._on_group_update),
+                self._sendspin.add_metadata_listener(self._on_metadata),
+                self._sendspin.add_server_command_listener(self._on_server_command),
+                self._sendspin.add_disconnect_listener(self._on_disconnect),
+            ]
 
-        try:
+            reconnect = True
+            try:
+                _LOGGER.info(
+                    "UDP Lyrics Player '%s' connecting to %s",
+                    self._player_name,
+                    self._server_url,
+                )
+                await self._sendspin.connect(self._server_url)
+                _LOGGER.info(
+                    "UDP Lyrics Player '%s' connected to Sendspin",
+                    self._player_name,
+                )
+            except asyncio.CancelledError:
+                reconnect = False
+                raise
+            except Exception as exc:
+                _LOGGER.error(
+                    "UDP Lyrics Player '%s' connection error with %s: %s",
+                    self._player_name,
+                    self._server_url,
+                    exc,
+                )
+            finally:
+                self._attr_state = MediaPlayerState.IDLE
+                self._stream_active = False
+                self._clear_audio_pipeline()
+                self.async_write_ha_state()
+                await self._teardown_sendspin()
+
+            if not reconnect:
+                break
+
             _LOGGER.info(
-                "UDP Lyrics Player '%s' connecting to %s",
+                "UDP Lyrics Player '%s' reconnecting in %.1fs",
                 self._player_name,
-                self._server_url,
+                _RECONNECT_DELAY_SECONDS,
             )
-            await self._sendspin.connect(self._server_url)
-            _LOGGER.info(
-                "UDP Lyrics Player '%s' connected to Sendspin",
-                self._player_name,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _LOGGER.error(
-                "UDP Lyrics Player '%s' failed to connect to %s: %s",
-                self._player_name,
-                self._server_url,
-                exc,
-            )
-            self._attr_state = MediaPlayerState.IDLE
-            self.async_write_ha_state()
+            await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
 
     async def _teardown_sendspin(self) -> None:
         """Remove listeners and disconnect gracefully."""
@@ -446,6 +465,18 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             self._sendspin = None
 
     # ── Audio worker (single task, strict FIFO) ──────────────────────────────
+
+    def _clear_audio_pipeline(self) -> None:
+        """Drop any queued/partial audio and reset stream state."""
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._udp_buffer.clear()
+        self._in_buffer.clear()
+        self._stream = {}
+        self._resampler = None
 
     async def _audio_worker_loop(self) -> None:
         """Process audio chunks one-by-one in strict chronological order.
@@ -559,15 +590,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     def _on_stream_start(self, payload: Any) -> None:
         """Store stream format metadata and create the PyAV resampler."""
-        self._udp_buffer.clear()
-        self._in_buffer.clear()
-
-        # Drain stale chunks from a previous stream
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._clear_audio_pipeline()
 
         if isinstance(payload, dict):
             player_info = payload
@@ -606,6 +629,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         # New stream → new RTP session (fresh sequence number, timestamp, SSRC)
         self._reset_rtp_state()
+        self._stream_active = True
 
         _LOGGER.debug("Sendspin stream started: %s", self._stream)
         self._attr_state = MediaPlayerState.PLAYING
@@ -615,12 +639,13 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self, timestamp: float, data: bytes, audio_format: Any = None
     ) -> None:
         """Queue the incoming audio chunk for the worker to process."""
-        if data and self._udp_sock is not None:
+        if data and self._udp_sock is not None and self._stream_active:
             self._audio_queue.put_nowait((int(timestamp), data))
 
     def _on_stream_end(self) -> None:
         """Flush the soxr resampler tail, send remaining buffer, clean up."""
         _LOGGER.debug("Sendspin stream ended")
+        self._stream_active = False
 
         # Flush the resampler's internal delay line
         if self._resampler is not None:
@@ -642,9 +667,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 )
             except Exception as exc:
                 _LOGGER.debug("UDP flush error: %s", exc)
-        self._udp_buffer.clear()
-        self._in_buffer.clear()
-        self._stream = {}
+        self._clear_audio_pipeline()
 
     def _on_group_update(self, state: Any) -> None:
         """Sync HA state with the Sendspin group playback state."""
@@ -658,10 +681,15 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             raw_upper = str(raw).upper()
             if "PLAYING" in raw_upper:
                 self._attr_state = MediaPlayerState.PLAYING
+                self._stream_active = True
             elif "PAUSED" in raw_upper:
                 self._attr_state = MediaPlayerState.PAUSED
+                self._stream_active = False
+                self._clear_audio_pipeline()
             elif "STOPPED" in raw_upper or "IDLE" in raw_upper:
                 self._attr_state = MediaPlayerState.IDLE
+                self._stream_active = False
+                self._clear_audio_pipeline()
             self.async_write_ha_state()
         except Exception as exc:
             _LOGGER.debug("Group update error: %s", exc)
@@ -706,7 +734,8 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             reason,
         )
         self._attr_state = MediaPlayerState.IDLE
-        self._stream = {}
+        self._stream_active = False
+        self._clear_audio_pipeline()
         self.async_write_ha_state()
 
     # ── HA media player controls ──────────────────────────────────────────────
