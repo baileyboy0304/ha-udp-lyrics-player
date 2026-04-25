@@ -618,7 +618,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         if data and self._udp_sock is not None:
             self._audio_queue.put_nowait((int(timestamp), data))
 
-    def _on_stream_end(self) -> None:
+    def _on_stream_end(self, roles: Any = None) -> None:
         """Flush the soxr resampler tail, send remaining buffer, clean up."""
         _LOGGER.debug("Sendspin stream ended")
 
