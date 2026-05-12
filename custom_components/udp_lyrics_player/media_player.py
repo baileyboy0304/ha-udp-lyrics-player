@@ -46,7 +46,8 @@ from homeassistant.components.media_player import (
     MediaPlayerState,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -77,6 +78,12 @@ _RTP_EXT_ID_MA_PLAYER_NAME = 1
 _RTP_EXT_ID_MA_PLAYER_ID = 2
 _RTP_EXT_BURST_PACKET_COUNT = 5
 _RTP_EXT_HEARTBEAT_SECONDS = 2.0
+
+# Reconnect backoff bounds (seconds). The Sendspin server is often unreachable
+# for a short window after a Home Assistant restart, so we keep retrying with
+# exponential backoff instead of giving up after a single failed connect.
+_RECONNECT_BACKOFF_INITIAL = 2.0
+_RECONNECT_BACKOFF_MAX = 60.0
 
 
 # ── Platform setup ────────────────────────────────────────────────────────────
@@ -139,6 +146,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._connect_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._listener_removers: list = []
+        # Set whenever a reconnect is requested (initial start, or after a
+        # server-initiated disconnect). The connect loop waits on this between
+        # attempts so callbacks can trigger an immediate retry.
+        self._reconnect_event: asyncio.Event = asyncio.Event()
 
         # Audio pipeline state — only touched by the single worker task.
         self._audio_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue()
@@ -352,7 +363,63 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     # ── Sendspin connection ───────────────────────────────────────────────────
 
     async def _run_sendspin(self) -> None:
-        """Connect to the Sendspin server and keep the connection alive."""
+        """Connect to the Sendspin server and keep retrying on failure.
+
+        On Home Assistant startup the Sendspin server is frequently not yet
+        reachable when entities are added. Instead of giving up after a single
+        attempt (which previously required the user to press *Reload* on the
+        integration), we wait for HA to finish starting and then loop with
+        exponential backoff. The same loop also drives reconnection after a
+        server-initiated disconnect.
+        """
+        # Wait until Home Assistant has finished starting so we don't race the
+        # Sendspin server, the network stack, or DNS coming up.
+        if self.hass.state is not CoreState.running:
+            started = asyncio.Event()
+
+            def _on_started(_event):
+                started.set()
+
+            unsub = self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED, _on_started
+            )
+            try:
+                await started.wait()
+            finally:
+                unsub()
+
+        backoff = _RECONNECT_BACKOFF_INITIAL
+        while True:
+            try:
+                await self._connect_once()
+                # Connected successfully — reset backoff and wait for a
+                # disconnect-triggered reconnect request.
+                backoff = _RECONNECT_BACKOFF_INITIAL
+                self._reconnect_event.clear()
+                await self._reconnect_event.wait()
+                self._reconnect_event.clear()
+                # Drop the dead client before reconnecting.
+                await self._teardown_sendspin()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _LOGGER.warning(
+                    "UDP Lyrics Player '%s' connect to %s failed: %s "
+                    "(retrying in %.0fs)",
+                    self._player_name,
+                    self._server_url,
+                    exc,
+                    backoff,
+                )
+                await self._teardown_sendspin()
+                try:
+                    await asyncio.sleep(backoff)
+                except asyncio.CancelledError:
+                    raise
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
+
+    async def _connect_once(self) -> None:
+        """Build a fresh SendspinClient and open the connection."""
         supported_formats = [
             SupportedAudioFormat(
                 codec=AudioCodec.PCM,
@@ -403,28 +470,16 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             self._sendspin.add_disconnect_listener(self._on_disconnect),
         ]
 
-        try:
-            _LOGGER.info(
-                "UDP Lyrics Player '%s' connecting to %s",
-                self._player_name,
-                self._server_url,
-            )
-            await self._sendspin.connect(self._server_url)
-            _LOGGER.info(
-                "UDP Lyrics Player '%s' connected to Sendspin",
-                self._player_name,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _LOGGER.error(
-                "UDP Lyrics Player '%s' failed to connect to %s: %s",
-                self._player_name,
-                self._server_url,
-                exc,
-            )
-            self._attr_state = MediaPlayerState.IDLE
-            self.async_write_ha_state()
+        _LOGGER.info(
+            "UDP Lyrics Player '%s' connecting to %s",
+            self._player_name,
+            self._server_url,
+        )
+        await self._sendspin.connect(self._server_url)
+        _LOGGER.info(
+            "UDP Lyrics Player '%s' connected to Sendspin",
+            self._player_name,
+        )
 
     async def _teardown_sendspin(self) -> None:
         """Remove listeners and disconnect gracefully."""
@@ -699,7 +754,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             _LOGGER.debug("Server command error: %s", exc)
 
     def _on_disconnect(self, reason: str) -> None:
-        """Handle server-initiated disconnection."""
+        """Handle server-initiated disconnection by triggering a reconnect."""
         _LOGGER.warning(
             "UDP Lyrics Player '%s' disconnected from Sendspin: %s",
             self._player_name,
@@ -708,6 +763,8 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._attr_state = MediaPlayerState.IDLE
         self._stream = {}
         self.async_write_ha_state()
+        # Wake the connect loop so it tears down this client and reconnects.
+        self._reconnect_event.set()
 
     # ── HA media player controls ──────────────────────────────────────────────
 
