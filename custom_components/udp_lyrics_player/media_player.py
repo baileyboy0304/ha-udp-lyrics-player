@@ -753,18 +753,26 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         except Exception as exc:
             _LOGGER.debug("Server command error: %s", exc)
 
-    def _on_disconnect(self, reason: str) -> None:
-        """Handle server-initiated disconnection by triggering a reconnect."""
-        _LOGGER.warning(
-            "UDP Lyrics Player '%s' disconnected from Sendspin: %s",
-            self._player_name,
-            reason,
-        )
-        self._attr_state = MediaPlayerState.IDLE
-        self._stream = {}
-        self.async_write_ha_state()
-        # Wake the connect loop so it tears down this client and reconnects.
-        self._reconnect_event.set()
+    def _on_disconnect(self, reason: Any = None, *args: Any, **kwargs: Any) -> None:
+        """Handle server-initiated disconnection by triggering a reconnect.
+
+        aiosendspin invokes this callback with no arguments in some versions
+        and with a reason string in others, so accept either shape — raising
+        a TypeError here would prevent the reconnect event from being set.
+        """
+        try:
+            _LOGGER.warning(
+                "UDP Lyrics Player '%s' disconnected from Sendspin: %s",
+                self._player_name,
+                reason,
+            )
+            self._attr_state = MediaPlayerState.IDLE
+            self._stream = {}
+            self.async_write_ha_state()
+        finally:
+            # Always wake the connect loop so it tears down this client and
+            # reconnects, even if state bookkeeping above raised.
+            self._reconnect_event.set()
 
     # ── HA media player controls ──────────────────────────────────────────────
 
