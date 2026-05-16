@@ -186,11 +186,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     async def async_added_to_hass(self) -> None:
         """Open the UDP socket, start the audio worker, and connect."""
         self._open_udp_socket()
-        self._worker_task = self.hass.async_create_task(
+        # Background tasks: infinite loops that must not block HA bootstrap.
+        # async_create_task is tracked by setup and would trigger a 60s
+        # "setup timed out" warning when these loops never complete.
+        self._worker_task = self.hass.async_create_background_task(
             self._audio_worker_loop(),
             name=f"udp_lyrics_worker_{self._client_id}",
         )
-        self._connect_task = self.hass.async_create_task(
+        self._connect_task = self.hass.async_create_background_task(
             self._run_sendspin(),
             name=f"udp_lyrics_conn_{self._client_id}",
         )
@@ -386,7 +389,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             try:
                 await started.wait()
             finally:
-                unsub()
+                # async_listen_once self-removes after firing, so only unsub
+                # if we're bailing out before the event arrived (e.g. cancel).
+                if not started.is_set():
+                    unsub()
 
         backoff = _RECONNECT_BACKOFF_INITIAL
         while True:
