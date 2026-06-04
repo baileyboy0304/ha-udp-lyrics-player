@@ -56,8 +56,6 @@ from .const import (
     CONF_UDP_HOST,
     CONF_UDP_PORT,
     DOMAIN,
-    UDP_AUDIO_BIT_DEPTH,
-    UDP_AUDIO_CHANNELS,
     UDP_AUDIO_SAMPLE_RATE,
 )
 
@@ -433,13 +431,17 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     async def _connect_once(self) -> None:
         """Build a fresh SendspinClient and open the connection."""
+        # Advertise ONLY group-compatible formats. A Sendspin sync group plays
+        # one shared encoded stream to every member, so MA must pick a single
+        # format that every member supports. Real speakers (Waveshare,
+        # reSpeaker XVF3800) stream CD/48k stereo PCM; none can play 16 kHz
+        # mono. The 16 kHz mono profile is purely our internal UDP-output
+        # concern — _process_chunk() downconverts whatever input format we
+        # receive to 16 kHz mono before sending over UDP — so it must NOT be
+        # advertised here. Offering a format no real speaker supports prevents
+        # MA from finding a common sync format and blocks grouping
+        # ("can not be grouped with respeaker_lyrics").
         supported_formats = [
-            SupportedAudioFormat(
-                codec=AudioCodec.PCM,
-                sample_rate=UDP_AUDIO_SAMPLE_RATE,
-                bit_depth=UDP_AUDIO_BIT_DEPTH,
-                channels=UDP_AUDIO_CHANNELS,
-            ),
             SupportedAudioFormat(
                 codec=AudioCodec.PCM,
                 sample_rate=48000,
