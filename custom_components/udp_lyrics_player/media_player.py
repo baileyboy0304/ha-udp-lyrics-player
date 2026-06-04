@@ -129,6 +129,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # HA entity attributes
         self._attr_unique_id = config_entry.entry_id
         self._attr_state = MediaPlayerState.IDLE
+        # Logical player volume exposed to HA/Sendspin/MA. This is deliberately
+        # not applied as gain in the UDP PCM/RTP path so the lyrics/listening
+        # service always receives full-scale audio.
         self._attr_volume_level: float = 1.0
         self._attr_is_volume_muted: bool = False
         self._attr_media_title: str | None = None
@@ -471,7 +474,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 manufacturer="Music Companion",
                 software_version="1.0.0",
             ),
-            initial_volume=int(self._attr_volume_level * 100),
+            initial_volume=self._logical_volume_percent,
             initial_muted=self._attr_is_volume_muted,
         )
 
@@ -534,20 +537,41 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     # ── Player-state reporting ────────────────────────────────────────────────
 
+    @property
+    def _logical_volume_percent(self) -> int:
+        """Return the logical HA/Sendspin volume as an integer percent."""
+        return round(self._attr_volume_level * 100)
+
+    @staticmethod
+    def _coerce_logical_volume_level(volume: Any) -> float:
+        """Normalize a HA fraction or Sendspin percent volume to a 0..1 level."""
+        raw_volume = float(volume)
+        if raw_volume > 1.0:
+            raw_volume /= 100.0
+        return max(0.0, min(1.0, raw_volume))
+
     async def _report_player_state(self) -> None:
         """Report this player's client state to the Sendspin server.
 
         ``send_player_state`` carries the *client* state (always SYNCHRONIZED
-        while we are operational) together with volume/mute. It does not carry
-        play/pause — transport state is server-owned — but sending it on every
-        transition and on a heartbeat resets Music Assistant's freshness clock
-        for this player so it is never reported as stale/idle.
+        while we are operational) together with logical volume/mute. It does not
+        carry play/pause — transport state is server-owned — but sending it on
+        every transition and on a heartbeat resets Music Assistant's freshness
+        clock for this player so it is never reported as stale/idle. The logical
+        volume reported here is not applied to UDP audio samples.
         """
         if self._sendspin and self._sendspin.connected:
             try:
+                volume = self._logical_volume_percent
+                _LOGGER.debug(
+                    "Reporting Sendspin player state for '%s': volume=%s muted=%s",
+                    self._player_name,
+                    volume,
+                    self._attr_is_volume_muted,
+                )
                 await self._sendspin.send_player_state(
                     state=PlayerStateType.SYNCHRONIZED,
-                    volume=int(self._attr_volume_level * 100),
+                    volume=volume,
                     muted=self._attr_is_volume_muted,
                 )
             except Exception as exc:
@@ -829,15 +853,30 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             _LOGGER.debug("Metadata update error: %s", exc)
 
     def _on_server_command(self, payload: Any) -> None:
-        """Apply volume / mute commands sent by the Sendspin server."""
+        """Apply logical volume / mute commands sent by the Sendspin server."""
         try:
-            volume = getattr(payload, "volume", None)
+            volume = (
+                payload.get("volume")
+                if isinstance(payload, dict)
+                else getattr(payload, "volume", None)
+            )
+            muted = (
+                payload.get("muted")
+                if isinstance(payload, dict)
+                else getattr(payload, "muted", None)
+            )
             if volume is not None:
-                self._attr_volume_level = max(0.0, min(1.0, volume / 100.0))
-            muted = getattr(payload, "muted", None)
+                self._attr_volume_level = self._coerce_logical_volume_level(volume)
+                _LOGGER.debug(
+                    "Received Sendspin volume command for '%s': raw=%s logical=%s%%",
+                    self._player_name,
+                    volume,
+                    self._logical_volume_percent,
+                )
             if muted is not None:
                 self._attr_is_volume_muted = bool(muted)
             self.async_write_ha_state()
+            self._schedule_player_state_report()
         except Exception as exc:
             _LOGGER.debug("Server command error: %s", exc)
 
@@ -896,7 +935,13 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         await self._send_group_cmd(MediaCommand.PREVIOUS)
 
     async def async_set_volume_level(self, volume: float) -> None:
-        self._attr_volume_level = volume
+        self._attr_volume_level = self._coerce_logical_volume_level(volume)
+        _LOGGER.debug(
+            "Received HA volume command for '%s': raw=%s logical=%s%%",
+            self._player_name,
+            volume,
+            self._logical_volume_percent,
+        )
         await self._report_player_state()
         self.async_write_ha_state()
 
