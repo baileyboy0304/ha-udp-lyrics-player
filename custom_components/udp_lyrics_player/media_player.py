@@ -79,6 +79,12 @@ _RTP_EXT_ID_MA_PLAYER_ID = 2
 _RTP_EXT_BURST_PACKET_COUNT = 5
 _RTP_EXT_HEARTBEAT_SECONDS = 2.0
 
+# How often to re-report this player's client state to the Sendspin server
+# while connected. The RTP extension heartbeat above only reaches the
+# SyncLyrics UDP receiver; this separate Sendspin-connection heartbeat keeps
+# Music Assistant's view of the player fresh so it is never marked stale.
+_PLAYER_STATE_HEARTBEAT_SECONDS = 2.0
+
 # Reconnect backoff bounds (seconds). The Sendspin server is often unreachable
 # for a short window after a Home Assistant restart, so we keep retrying with
 # exponential backoff instead of giving up after a single failed connect.
@@ -145,6 +151,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._stream: dict[str, Any] = {}
         self._connect_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
+        self._state_heartbeat_task: asyncio.Task | None = None
         self._listener_removers: list = []
         # Set whenever a reconnect is requested (initial start, or after a
         # server-initiated disconnect). The connect loop waits on this between
@@ -487,8 +494,25 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             self._player_name,
         )
 
+        # Report our state immediately and start the periodic heartbeat so
+        # Music Assistant keeps a fresh view of this player and never marks
+        # it stale while it sits in a sync group.
+        await self._report_player_state()
+        self._state_heartbeat_task = self.hass.async_create_background_task(
+            self._player_state_heartbeat_loop(),
+            name=f"udp_lyrics_state_hb_{self._client_id}",
+        )
+
     async def _teardown_sendspin(self) -> None:
         """Remove listeners and disconnect gracefully."""
+        if self._state_heartbeat_task and not self._state_heartbeat_task.done():
+            self._state_heartbeat_task.cancel()
+            try:
+                await self._state_heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._state_heartbeat_task = None
+
         for remove_fn in self._listener_removers:
             if callable(remove_fn):
                 try:
@@ -505,6 +529,43 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             except Exception as exc:
                 _LOGGER.debug("Error during Sendspin disconnect: %s", exc)
             self._sendspin = None
+
+    # ── Player-state reporting ────────────────────────────────────────────────
+
+    async def _report_player_state(self) -> None:
+        """Report this player's client state to the Sendspin server.
+
+        ``send_player_state`` carries the *client* state (always SYNCHRONIZED
+        while we are operational) together with volume/mute. It does not carry
+        play/pause — transport state is server-owned — but sending it on every
+        transition and on a heartbeat resets Music Assistant's freshness clock
+        for this player so it is never reported as stale/idle.
+        """
+        if self._sendspin and self._sendspin.connected:
+            try:
+                await self._sendspin.send_player_state(
+                    state=PlayerStateType.SYNCHRONIZED,
+                    volume=int(self._attr_volume_level * 100),
+                    muted=self._attr_is_volume_muted,
+                )
+            except Exception as exc:
+                _LOGGER.debug("send_player_state error: %s", exc)
+
+    def _schedule_player_state_report(self) -> None:
+        """Fire-and-forget a player-state report from a sync callback context."""
+        if self._sendspin and self._sendspin.connected:
+            self.hass.async_create_task(self._report_player_state())
+
+    async def _player_state_heartbeat_loop(self) -> None:
+        """Periodically re-report player state so MA never marks us stale."""
+        while True:
+            try:
+                await asyncio.sleep(_PLAYER_STATE_HEARTBEAT_SECONDS)
+                await self._report_player_state()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                _LOGGER.debug("Player state heartbeat error: %s", exc)
 
     # ── Audio worker (single task, strict FIFO) ──────────────────────────────
 
@@ -671,6 +732,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         _LOGGER.debug("Sendspin stream started: %s", self._stream)
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
+        self._schedule_player_state_report()
 
     def _on_audio_chunk(
         self, timestamp: float, data: bytes, audio_format: Any = None
@@ -707,6 +769,17 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._in_buffer.clear()
         self._stream = {}
 
+        # The audio stream stops on both pause and stop, and the stream-end
+        # event itself can't distinguish them. Default to PAUSED so MA's view
+        # of this player leaves PLAYING immediately; an authoritative
+        # _on_group_update (if one arrives) will correct this to IDLE when the
+        # group actually stopped. Only downgrade from an active PLAYING state
+        # so we don't clobber an already-IDLE entity.
+        if self._attr_state == MediaPlayerState.PLAYING:
+            self._attr_state = MediaPlayerState.PAUSED
+            self.async_write_ha_state()
+        self._schedule_player_state_report()
+
     def _on_group_update(self, state: Any) -> None:
         """Sync HA state with the Sendspin group playback state."""
         try:
@@ -716,14 +789,21 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             )
             if raw is None:
                 return
+            # A group update is authoritative for transport state when present.
             raw_upper = str(raw).upper()
+            new_state = self._attr_state
             if "PLAYING" in raw_upper:
-                self._attr_state = MediaPlayerState.PLAYING
+                new_state = MediaPlayerState.PLAYING
             elif "PAUSED" in raw_upper:
-                self._attr_state = MediaPlayerState.PAUSED
+                new_state = MediaPlayerState.PAUSED
             elif "STOPPED" in raw_upper or "IDLE" in raw_upper:
-                self._attr_state = MediaPlayerState.IDLE
+                new_state = MediaPlayerState.IDLE
+
+            changed = new_state != self._attr_state
+            self._attr_state = new_state
             self.async_write_ha_state()
+            if changed:
+                self._schedule_player_state_report()
         except Exception as exc:
             _LOGGER.debug("Group update error: %s", exc)
 
@@ -793,16 +873,19 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         await self._send_group_cmd(MediaCommand.PLAY)
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
+        await self._report_player_state()
 
     async def async_media_pause(self) -> None:
         await self._send_group_cmd(MediaCommand.PAUSE)
         self._attr_state = MediaPlayerState.PAUSED
         self.async_write_ha_state()
+        await self._report_player_state()
 
     async def async_media_stop(self) -> None:
         await self._send_group_cmd(MediaCommand.STOP)
         self._attr_state = MediaPlayerState.IDLE
         self.async_write_ha_state()
+        await self._report_player_state()
 
     async def async_media_next_track(self) -> None:
         await self._send_group_cmd(MediaCommand.NEXT)
@@ -812,26 +895,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     async def async_set_volume_level(self, volume: float) -> None:
         self._attr_volume_level = volume
-        if self._sendspin and self._sendspin.connected:
-            try:
-                await self._sendspin.send_player_state(
-                    state=PlayerStateType.SYNCHRONIZED,
-                    volume=int(self._attr_volume_level * 100),
-                    muted=self._attr_is_volume_muted,
-                )
-            except Exception as exc:
-                _LOGGER.debug("send_player_state error: %s", exc)
+        await self._report_player_state()
         self.async_write_ha_state()
 
     async def async_mute_volume(self, mute: bool) -> None:
         self._attr_is_volume_muted = mute
-        if self._sendspin and self._sendspin.connected:
-            try:
-                await self._sendspin.send_player_state(
-                    state=PlayerStateType.SYNCHRONIZED,
-                    volume=int(self._attr_volume_level * 100),
-                    muted=self._attr_is_volume_muted,
-                )
-            except Exception as exc:
-                _LOGGER.debug("send_player_state error: %s", exc)
+        await self._report_player_state()
         self.async_write_ha_state()
