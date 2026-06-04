@@ -855,15 +855,28 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     def _on_server_command(self, payload: Any) -> None:
         """Apply logical volume / mute commands sent by the Sendspin server."""
         try:
-            volume = (
-                payload.get("volume")
+            # aiosendspin server/command payloads wrap player commands in a
+            # nested ``player`` object: {player: {command, volume|mute}}. Keep
+            # direct-key fallbacks for older/untyped payloads seen in the wild.
+            player = (
+                payload.get("player")
                 if isinstance(payload, dict)
-                else getattr(payload, "volume", None)
+                else getattr(payload, "player", None)
+            )
+            command_payload = player if player is not None else payload
+            volume = (
+                command_payload.get("volume")
+                if isinstance(command_payload, dict)
+                else getattr(command_payload, "volume", None)
             )
             muted = (
-                payload.get("muted")
-                if isinstance(payload, dict)
-                else getattr(payload, "muted", None)
+                command_payload.get("mute", command_payload.get("muted"))
+                if isinstance(command_payload, dict)
+                else getattr(
+                    command_payload,
+                    "mute",
+                    getattr(command_payload, "muted", None),
+                )
             )
             if volume is not None:
                 self._attr_volume_level = self._coerce_logical_volume_level(volume)
@@ -875,8 +888,9 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 )
             if muted is not None:
                 self._attr_is_volume_muted = bool(muted)
-            self.async_write_ha_state()
-            self._schedule_player_state_report()
+            if volume is not None or muted is not None:
+                self.async_write_ha_state()
+                self._schedule_player_state_report()
         except Exception as exc:
             _LOGGER.debug("Server command error: %s", exc)
 
