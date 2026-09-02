@@ -3,8 +3,8 @@
 Connects to a Sendspin server as a PLAYER client so that it participates in
 the synchronised playback group.  Every PCM audio chunk received from the
 server is resampled to 16-bit mono 16 kHz and forwarded over UDP to the
-configured destination, making the audio available to the Music Companion
-lyrics-recognition (tagging) service.
+configured destination, making the audio available to LyricsMachine's
+lyrics-recognition (tagging) service, which receives it on UDP 6056.
 
 Audio pipeline
 --------------
@@ -196,7 +196,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         return {
             "identifiers": {(DOMAIN, self._config_entry.entry_id)},
             "name": self._player_name,
-            "manufacturer": "Music Companion",
+            "manufacturer": "LyricsMachine",
             "model": "UDP Lyrics Player",
             "sw_version": "1.0.0",
         }
@@ -568,7 +568,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             player_support=player_support,
             device_info=DeviceInfo(
                 product_name="UDP Lyrics Player",
-                manufacturer="Music Companion",
+                manufacturer="LyricsMachine",
                 software_version="1.0.0",
             ),
             initial_volume=self._logical_volume_percent,
