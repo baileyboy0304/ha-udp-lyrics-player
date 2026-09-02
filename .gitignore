@@ -1,0 +1,15 @@
+# Python bytecode — never ship compiled files to HACS users
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build artefacts
+*.egg-info/
+build/
+dist/
+
+# Local development scratch, not part of the integration
+audio_capture.pcap
+output.wav
+extract_audio.py
+sendspin-cli-ref/
