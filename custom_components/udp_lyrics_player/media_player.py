@@ -16,12 +16,14 @@ Sendspin server  →  aiosendspin client  →  av.AudioFrame   →  PyAV resampl
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import os
 import random
 import socket
 import struct
 import time
-import uuid
+from pathlib import Path
 from typing import Any
 
 import av
@@ -31,14 +33,15 @@ from aiosendspin.models import (
     DeviceInfo,
     MediaCommand,
     PlayerCommand,
-    PlayerStateType,
     Roles,
 )
-from aiosendspin.models.core import GoodbyeReason
+from aiosendspin.models.types import GoodbyeReason
 from aiosendspin.models.player import (
     ClientHelloPlayerSupport,
     SupportedAudioFormat,
 )
+from aiosendspin.noise.keys import Identity, b64url_decode
+from aiosendspin.noise.trust_store import FileClientPairingStore
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -77,7 +80,7 @@ _RTP_EXT_ID_MA_PLAYER_ID = 2
 _RTP_EXT_BURST_PACKET_COUNT = 5
 _RTP_EXT_HEARTBEAT_SECONDS = 2.0
 
-# How often to re-report this player's client state to the Sendspin server
+# How often to re-report client-level availability to the Sendspin server
 # while connected. The RTP extension heartbeat above only reaches the
 # SyncLyrics UDP receiver; this separate Sendspin-connection heartbeat keeps
 # Music Assistant's view of the player fresh so it is never marked stale.
@@ -122,9 +125,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._udp_host: str = config_entry.data[CONF_UDP_HOST]
         self._udp_port: int = config_entry.data[CONF_UDP_PORT]
 
-        self._client_id: str = str(
-            uuid.uuid5(uuid.NAMESPACE_DNS, config_entry.entry_id)
-        )
+        # Sendspin >= 5 identifies a client by its long-term X25519 public key
+        # rather than a caller-chosen string, so client_id is only known once the
+        # identity has been loaded from (or written to) disk. Music Assistant uses
+        # this same value as its player_id, and it is what goes out in the RTP
+        # player-id extension so the UDP receiver can correlate the two.
+        self._identity: Identity | None = None
+        self._pairing_store: FileClientPairingStore | None = None
+        self._client_id: str = ""
 
         # HA entity attributes
         self._attr_unique_id = config_entry.entry_id
@@ -164,7 +172,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         self._reconnect_event: asyncio.Event = asyncio.Event()
 
         # Audio pipeline state — only touched by the single worker task.
-        self._audio_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue()
+        self._audio_queue: asyncio.Queue[tuple[int, bytes, Any]] = asyncio.Queue()
         self._udp_buffer: bytearray = bytearray()
         self._in_buffer: bytearray = bytearray()
         self._resampler: av.AudioResampler | None = None
@@ -201,13 +209,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # Background tasks: infinite loops that must not block HA bootstrap.
         # async_create_task is tracked by setup and would trigger a 60s
         # "setup timed out" warning when these loops never complete.
+        entry_id = self._config_entry.entry_id
         self._worker_task = self.hass.async_create_background_task(
             self._audio_worker_loop(),
-            name=f"udp_lyrics_worker_{self._client_id}",
+            name=f"udp_lyrics_worker_{entry_id}",
         )
         self._connect_task = self.hass.async_create_background_task(
             self._run_sendspin(),
-            name=f"udp_lyrics_conn_{self._client_id}",
+            name=f"udp_lyrics_conn_{entry_id}",
         )
 
     async def async_will_remove_from_hass(self) -> None:
@@ -452,8 +461,74 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     raise
                 backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
 
+    def _storage_dir(self) -> Path:
+        """Return this entry's private directory for identity and pairing state."""
+        return Path(
+            self.hass.config.path(".storage", DOMAIN, self._config_entry.entry_id)
+        )
+
+    @staticmethod
+    def _load_or_create_identity(storage_dir: Path) -> Identity:
+        """Load this player's long-term identity, generating one only if absent.
+
+        Blocking (file I/O) — call from an executor. A corrupt key file raises
+        rather than silently minting a new identity: a new key is a new
+        client_id, which Music Assistant would see as a brand new player.
+        """
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        key_path = storage_dir / "identity.key"
+        try:
+            return Identity.from_private_bytes(
+                b64url_decode(key_path.read_text().strip())
+            )
+        except FileNotFoundError:
+            pass
+        identity = Identity.generate()
+        try:
+            fd = os.open(key_path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # Lost a race with another writer; adopt whatever landed on disk.
+            return Identity.from_private_bytes(
+                b64url_decode(key_path.read_text().strip())
+            )
+        with os.fdopen(fd, "w") as handle:
+            handle.write(identity.private_b64u)
+        return identity
+
+    async def _ensure_identity(self) -> None:
+        """Load identity and pairing store once, and advertise guest access.
+
+        Music Assistant approves a client without any pairing step only when the
+        hello advertises unpaired access (`_auto_trust_guest_access`). This player
+        carries playback and nothing else, so there is nothing for the user to
+        decide — enable it so the player appears without a PIN exchange.
+        """
+        if self._identity is not None and self._pairing_store is not None:
+            return
+
+        storage_dir = self._storage_dir()
+        identity = await self.hass.async_add_executor_job(
+            self._load_or_create_identity, storage_dir
+        )
+        pairing_store = await FileClientPairingStore.open(
+            storage_dir / "pairing_store.json"
+        )
+
+        config = await pairing_store.get_pairing_config()
+        if not config.unpaired_access_enabled:
+            await pairing_store.store_pairing_config(
+                dataclasses.replace(config, unpaired_access_enabled=True)
+            )
+
+        self._identity = identity
+        self._pairing_store = pairing_store
+        self._client_id = identity.peer_id
+
     async def _connect_once(self) -> None:
         """Build a fresh SendspinClient and open the connection."""
+        await self._ensure_identity()
+        assert self._identity is not None and self._pairing_store is not None
+
         # Advertise ONLY group-compatible formats. A Sendspin sync group plays
         # one shared encoded stream to every member, so MA must pick a single
         # format that every member supports. Real speakers (Waveshare,
@@ -486,16 +561,21 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         )
 
         self._sendspin = SendspinClient(
-            client_id=self._client_id,
-            client_name=self._player_name,
-            roles=[Roles.PLAYER],
+            self._identity,
+            self._player_name,
+            [Roles.PLAYER],
+            pairing_store=self._pairing_store,
             player_support=player_support,
             device_info=DeviceInfo(
+                product_name="UDP Lyrics Player",
                 manufacturer="Music Companion",
                 software_version="1.0.0",
             ),
             initial_volume=self._logical_volume_percent,
             initial_muted=self._attr_is_volume_muted,
+            # state_supported_commands is deliberately unset: it advertises
+            # 'set_static_delay' only (volume/mute belong to player_support
+            # above), and this player exposes no server-settable static delay.
         )
 
         self._listener_removers = [
@@ -520,13 +600,13 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         )
         self._set_available(True)
 
-        # Report our state immediately and start the periodic heartbeat so
-        # Music Assistant keeps a fresh view of this player and never marks
-        # it stale while it sits in a sync group.
-        await self._report_player_state()
+        # The SDK sends full client state itself once the server activates our
+        # player role (and again on every reactivation), so all this needs to do
+        # is keep Music Assistant's view fresh while we sit in a sync group.
+        await self._report_availability()
         self._state_heartbeat_task = self.hass.async_create_background_task(
             self._player_state_heartbeat_loop(),
-            name=f"udp_lyrics_state_hb_{self._client_id}",
+            name=f"udp_lyrics_state_hb_{self._config_entry.entry_id}",
         )
 
     async def _teardown_sendspin(self) -> None:
@@ -549,9 +629,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         if self._sendspin is not None:
             try:
-                if self._sendspin.connected:
-                    await self._sendspin.send_goodbye(GoodbyeReason.SHUTDOWN)
-                    await self._sendspin.disconnect()
+                # disconnect() announces the goodbye itself, so the server drops
+                # us immediately instead of holding the client for its delayed
+                # reconnect grace period.
+                await self._sendspin.disconnect(GoodbyeReason.SHUTDOWN)
             except Exception as exc:
                 _LOGGER.debug("Error during Sendspin disconnect: %s", exc)
             self._sendspin = None
@@ -574,12 +655,12 @@ class UDPLyricsPlayer(MediaPlayerEntity):
     async def _report_player_state(self) -> None:
         """Report this player's client state to the Sendspin server.
 
-        ``send_player_state`` carries the *client* state (always SYNCHRONIZED
-        while we are operational) together with logical volume/mute. It does not
-        carry play/pause — transport state is server-owned — but sending it on
-        every transition and on a heartbeat resets Music Assistant's freshness
-        clock for this player so it is never reported as stale/idle. The logical
-        volume reported here is not applied to UDP audio samples.
+        ``send_player_state`` carries client availability (always True while we
+        are operational) together with logical volume/mute. It does not carry
+        play/pause — transport state is server-owned — but sending it on every
+        transition and on a heartbeat resets Music Assistant's freshness clock
+        for this player so it is never reported as stale/idle. The logical volume
+        reported here is not applied to UDP audio samples.
         """
         if self._sendspin and self._sendspin.connected:
             try:
@@ -591,7 +672,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     self._attr_is_volume_muted,
                 )
                 await self._sendspin.send_player_state(
-                    state=PlayerStateType.SYNCHRONIZED,
+                    available=True,
                     volume=volume,
                     muted=self._attr_is_volume_muted,
                 )
@@ -603,12 +684,26 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         if self._sendspin and self._sendspin.connected:
             self.hass.async_create_task(self._report_player_state())
 
+    async def _report_availability(self) -> None:
+        """Report client-level availability to the Sendspin server.
+
+        Deliberately not ``send_player_state``: that carries a player object,
+        which the server rejects as non-compliant whenever it has not activated
+        our player role — true for most of the time a player sits idle. Client
+        availability is role-agnostic and is the spec's way to say "still here".
+        """
+        if self._sendspin and self._sendspin.connected:
+            try:
+                await self._sendspin.send_available(available=True)
+            except Exception as exc:
+                _LOGGER.debug("send_available error: %s", exc)
+
     async def _player_state_heartbeat_loop(self) -> None:
-        """Periodically re-report player state so MA never marks us stale."""
+        """Periodically re-report availability so MA never marks us stale."""
         while True:
             try:
                 await asyncio.sleep(_PLAYER_STATE_HEARTBEAT_SECONDS)
-                await self._report_player_state()
+                await self._report_availability()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -627,14 +722,14 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
         while True:
             try:
-                timestamp, data = await self._audio_queue.get()
+                timestamp, data, pcm_format = await self._audio_queue.get()
 
                 if self._udp_sock is None:
                     continue
 
-                # Decode, mix to mono, resample — all in an executor thread
+                # Mix to mono and resample — all in an executor thread
                 pcm_out: bytes = await loop.run_in_executor(
-                    None, self._process_chunk, data
+                    None, self._process_chunk, data, pcm_format
                 )
 
                 if not pcm_out:
@@ -644,7 +739,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 if self._sendspin is not None:
                     try:
                         target_client_time_us = self._sendspin.compute_play_time(int(timestamp))
-                        now_us = int(time.monotonic() * 1_000_000)
+                        # Ask the client for "now" on its own clock rather than
+                        # assuming it is time.monotonic() — the SDK owns its clock
+                        # source and the two need not share a base.
+                        now_us = self._sendspin.now_us()
                         delay_sec = (target_client_time_us - now_us) / 1_000_000.0
                         if delay_sec > 0:
                             await asyncio.sleep(delay_sec)
@@ -664,17 +762,21 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             except Exception as exc:
                 _LOGGER.debug("Audio worker error: %s", exc)
 
-    def _process_chunk(self, data: bytes) -> bytes:
-        """Decode raw PCM, resample via PyAV, and encode to s16le mono.
+    def _process_chunk(self, data: bytes, pcm_format: Any) -> bytes:
+        """Mix decoded PCM to mono, resample via PyAV, and encode to s16le.
 
-        Called from an executor thread by the single worker task.
+        Called from an executor thread by the single worker task. ``pcm_format``
+        is the ``PCMFormat`` aiosendspin attached to this chunk: from Sendspin 5
+        the SDK decodes the stream itself (PCM and FLAC), so the chunk is always
+        raw PCM and its shape is described per chunk rather than inferred from
+        the stream/start payload.
         """
-        if self._resampler is None:
+        if self._resampler is None or pcm_format is None:
             return b""
 
-        in_rate = self._stream.get("sample_rate", 48000)
-        in_channels = self._stream.get("channels", 2)
-        in_bit_depth = self._stream.get("bit_depth", 16)
+        in_rate = pcm_format.sample_rate
+        in_channels = pcm_format.channels
+        in_bit_depth = pcm_format.bit_depth
 
         # Convert bit_depth to PyAV format
         if in_bit_depth == 16:
@@ -684,16 +786,18 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             in_format = "s32"
             bytes_per_sample = 4
         else:
+            # Only 16-bit formats are advertised in client/hello, so anything
+            # else means the server ignored our supported_formats list.
             _LOGGER.warning("Unsupported bit depth: %d", in_bit_depth)
             return b""
 
         layout = 'stereo' if in_channels == 2 else 'mono'
         frame_size = bytes_per_sample * in_channels
-        
+
         # Buffer incoming incomplete frames
         if data:
             self._in_buffer.extend(data)
-            
+
         samples = len(self._in_buffer) // frame_size
 
         if samples == 0:
@@ -726,10 +830,17 @@ class UDPLyricsPlayer(MediaPlayerEntity):
 
     # ── Sendspin event callbacks (synchronous, as aiosendspin requires) ───────
 
-    def _on_stream_start(self, payload: Any) -> None:
-        """Store stream format metadata and create the PyAV resampler."""
+    def _on_stream_start(self, message: Any) -> None:
+        """Reset the audio pipeline and create a fresh PyAV resampler.
+
+        The stream/start payload is no longer parsed for the input format: from
+        Sendspin 5 every audio chunk carries its own decoded ``PCMFormat``, which
+        is authoritative and removes the guesswork this used to do over dict and
+        attribute shapes.
+        """
         self._udp_buffer.clear()
         self._in_buffer.clear()
+        self._stream = {}
 
         # Drain stale chunks from a previous stream
         while not self._audio_queue.empty():
@@ -737,36 +848,6 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 self._audio_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-
-        if isinstance(payload, dict):
-            player_info = payload
-            if "payload" in player_info and isinstance(player_info["payload"], dict):
-                player_info = player_info["payload"]
-            if "player" in player_info and isinstance(player_info["player"], dict):
-                player_info = player_info["player"]
-
-            in_rate = player_info.get("sample_rate", 48000)
-            in_codec = player_info.get("codec", AudioCodec.PCM)
-            in_channels = player_info.get("channels", 2)
-            in_bit_depth = player_info.get("bit_depth", 16)
-        else:
-            player_info = payload
-            if hasattr(player_info, "payload") and player_info.payload is not None:
-                player_info = player_info.payload
-            if hasattr(player_info, "player") and player_info.player is not None:
-                player_info = player_info.player
-
-            in_rate = getattr(player_info, "sample_rate", 48000)
-            in_codec = getattr(player_info, "codec", AudioCodec.PCM)
-            in_channels = getattr(player_info, "channels", 2)
-            in_bit_depth = getattr(player_info, "bit_depth", 16)
-
-        self._stream = {
-            "codec": in_codec,
-            "sample_rate": in_rate,
-            "channels": in_channels,
-            "bit_depth": in_bit_depth,
-        }
 
         # Create a fresh PyAV streaming resampler
         self._resampler = av.AudioResampler(
@@ -776,17 +857,30 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # New stream → new RTP session (fresh sequence number, timestamp, SSRC)
         self._reset_rtp_state()
 
-        _LOGGER.debug("Sendspin stream started: %s", self._stream)
+        _LOGGER.debug("Sendspin stream started")
         self._attr_state = MediaPlayerState.PLAYING
         self.async_write_ha_state()
         self._schedule_player_state_report()
 
     def _on_audio_chunk(
-        self, timestamp: float, data: bytes, audio_format: Any = None
+        self, timestamp: int, data: bytes, audio_format: Any = None
     ) -> None:
-        """Queue the incoming audio chunk for the worker to process."""
-        if data and self._udp_sock is not None:
-            self._audio_queue.put_nowait((int(timestamp), data))
+        """Queue the incoming audio chunk, with its format, for the worker."""
+        if not data or self._udp_sock is None:
+            return
+        pcm_format = getattr(audio_format, "pcm_format", None)
+        if pcm_format is None:
+            _LOGGER.debug("Dropping audio chunk without a PCM format")
+            return
+        if not self._stream:
+            self._stream = {
+                "codec": getattr(audio_format, "codec", AudioCodec.PCM),
+                "sample_rate": pcm_format.sample_rate,
+                "channels": pcm_format.channels,
+                "bit_depth": pcm_format.bit_depth,
+            }
+            _LOGGER.debug("Sendspin stream format: %s", self._stream)
+        self._audio_queue.put_nowait((int(timestamp), data, pcm_format))
 
     def _on_stream_end(self, roles: Any = None) -> None:
         """Flush the soxr resampler tail, send remaining buffer, clean up."""
