@@ -2,7 +2,7 @@
 
 A Sendspin-compatible dummy media player that joins a Sendspin group for
 synchronised playback and forwards the received audio stream over UDP (16-bit
-mono 16 kHz PCM) to a configurable IP/port, typically the Music Companion
+mono 16 kHz PCM) to a configurable IP/port, typically LyricsMachine's
 lyrics-recognition tagging service.
 """
 
