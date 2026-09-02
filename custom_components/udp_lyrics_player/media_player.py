@@ -129,6 +129,10 @@ class UDPLyricsPlayer(MediaPlayerEntity):
         # HA entity attributes
         self._attr_unique_id = config_entry.entry_id
         self._attr_state = MediaPlayerState.IDLE
+        # Unavailable until the Sendspin handshake completes. A wrong server URL
+        # or an unreachable server otherwise leaves the entity looking healthy
+        # and idle in HA while the player never registers with Music Assistant.
+        self._attr_available = False
         # Logical player volume exposed to HA/Sendspin/MA. This is deliberately
         # not applied as gain in the UDP PCM/RTP path so the lyrics/listening
         # service always receives full-scale audio.
@@ -217,6 +221,21 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     pass
         await self._teardown_sendspin()
         self._close_udp_socket()
+
+    # ── Availability ──────────────────────────────────────────────────────────
+
+    def _set_available(self, available: bool) -> None:
+        """Publish a change in Sendspin connectivity as HA entity availability.
+
+        Safe to call from the connect loop and from aiosendspin callbacks: it is
+        a no-op when nothing changed, and while the entity is not (yet) attached
+        to hass it updates the attribute without writing state.
+        """
+        if self._attr_available == available:
+            return
+        self._attr_available = available
+        if self.hass is not None and self.entity_id:
+            self.async_write_ha_state()
 
     # ── UDP socket ────────────────────────────────────────────────────────────
 
@@ -425,6 +444,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                     exc,
                     backoff,
                 )
+                self._set_available(False)
                 await self._teardown_sendspin()
                 try:
                     await asyncio.sleep(backoff)
@@ -498,6 +518,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
             "UDP Lyrics Player '%s' connected to Sendspin",
             self._player_name,
         )
+        self._set_available(True)
 
         # Report our state immediately and start the periodic heartbeat so
         # Music Assistant keeps a fresh view of this player and never marks
@@ -908,6 +929,7 @@ class UDPLyricsPlayer(MediaPlayerEntity):
                 reason,
             )
             self._attr_state = MediaPlayerState.IDLE
+            self._attr_available = False
             self._stream = {}
             self.async_write_ha_state()
         finally:

@@ -23,6 +23,14 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][config_entry.entry_id] = {}
 
+    # The options flow writes the edited fields back into config_entry.data, but
+    # nothing acts on that unless an update listener is registered — without this
+    # a changed Sendspin URL / UDP target only takes effect after a full HA
+    # restart, because the running entity keeps its constructor-time values.
+    config_entry.async_on_unload(
+        config_entry.add_update_listener(async_reload_entry)
+    )
+
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
     return True
 
@@ -38,6 +46,9 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
 
 
 async def async_reload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
-    """Reload the config entry (called by HA on options update)."""
-    await async_unload_entry(hass, config_entry)
-    await async_setup_entry(hass, config_entry)
+    """Reload the config entry (registered as the options update listener).
+
+    Delegates to the config-entry manager rather than calling unload/setup
+    directly so HA keeps its own entry state machine consistent.
+    """
+    await hass.config_entries.async_reload(config_entry.entry_id)
